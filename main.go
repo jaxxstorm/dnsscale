@@ -69,7 +69,7 @@ func (d *TailscaleDevice) ToTailscaleNode() TailscaleNode {
 	if name == "" {
 		name = d.Hostname
 	}
-	
+
 	// Remove the Tailscale domain suffix to get just the device name
 	// e.g., "lbr-macbook-pro.tail4cf751.ts.net" -> "lbr-macbook-pro"
 	if dotIndex := strings.Index(name, "."); dotIndex > 0 {
@@ -335,7 +335,7 @@ func (r *DNSReconciler) reconcile(ctx context.Context, key string) error {
 
 	// Create DNS records for the node
 	recordName := fmt.Sprintf("%s.%s", node.Name, r.domain)
-	
+
 	for _, addr := range node.Addresses {
 		recordType := "A"
 		if strings.Contains(addr, ":") {
@@ -369,7 +369,7 @@ func (r *DNSReconciler) reconcile(ctx context.Context, key string) error {
 	}
 
 	if err := r.dnsProvider.UpdateRecord(ctx, r.domain, txtRecord); err != nil {
-		r.logger.Warn("Failed to create TXT ownership record", 
+		r.logger.Warn("Failed to create TXT ownership record",
 			zap.String("record_name", txtRecord.Name),
 			zap.Error(err))
 		// Don't fail the entire reconciliation if TXT record fails
@@ -396,10 +396,10 @@ func (r *DNSReconciler) deleteNodeDNS(ctx context.Context, nodeID string) error 
 		if record.Type == "TXT" && strings.Contains(record.Value, fmt.Sprintf("node_id=%s", nodeID)) {
 			// This is our ownership record, delete all records with this name
 			recordName := record.Name
-			r.logger.Info("Found dnsscale-managed record to delete", 
+			r.logger.Info("Found dnsscale-managed record to delete",
 				zap.String("record_name", recordName),
 				zap.String("node_id", nodeID))
-			
+
 			// Delete all records (A, AAAA, TXT) with this name
 			for _, recordToDelete := range records {
 				if recordToDelete.Name == recordName {
