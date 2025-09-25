@@ -1,0 +1,38 @@
+# DNSScale Configuration File for _lbr_sandbox tailnet and briggs.work domain
+
+tailscale:
+  # Tailscale API key - get this from https://login.tailscale.com/admin/settings/keys
+  api_key: "YOUR_TAILSCALE_API_KEY_HERE"
+  # Your tailnet name
+  tailnet: "_lbr_sandbox"
+
+dns:
+  # DNS provider: cloudflare
+  provider: "cloudflare"
+  # The domain to manage DNS records for
+  domain: "briggs.work"
+  # The zone ID from Cloudflare (get from the domain overview page)
+  zone_id: "YOUR_CLOUDFLARE_ZONE_ID_HERE"
+  
+  # Cloudflare-specific configuration
+  cloudflare:
+    # Get this from https://dash.cloudflare.com/profile/api-tokens
+    # Create a token with Zone:Read, DNS:Edit permissions for briggs.work zone
+    api_token: "YOUR_CLOUDFLARE_API_TOKEN_HERE"
+
+app:
+  # Number of worker goroutines for processing DNS updates
+  workers: 2
+  # How often to poll Tailscale API for changes
+  poll_interval: "30s"
+  # Only manage nodes with these tags (optional)
+  # If empty, all nodes will be managed
+  # required_tags:
+  #   - "tag:production"
+  #   - "tag:webserver"
+
+logging:
+  # Log level: debug, info, warn, error
+  level: "info"
+  # Log format: json or console
+  format: "console"
