@@ -2,6 +2,7 @@ package providers
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -28,7 +29,7 @@ type PiholeAPIResponse struct {
 	Error  string `json:"error,omitempty"`
 }
 
-func NewPiholeProvider(baseURL, apiToken string) (*PiholeProvider, error) {
+func NewPiholeProvider(baseURL, apiToken string, tlsInsecureSkipVerify bool) (*PiholeProvider, error) {
 	if baseURL == "" {
 		return nil, fmt.Errorf("pi-hole base URL is required")
 	}
@@ -39,10 +40,22 @@ func NewPiholeProvider(baseURL, apiToken string) (*PiholeProvider, error) {
 	// Ensure baseURL doesn't end with slash
 	baseURL = strings.TrimSuffix(baseURL, "/")
 
+	// Create HTTP client with custom TLS configuration
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: tlsInsecureSkipVerify,
+		},
+	}
+
+	httpClient := &http.Client{
+		Timeout:   30 * time.Second,
+		Transport: transport,
+	}
+
 	return &PiholeProvider{
 		baseURL:    baseURL,
 		apiToken:   apiToken,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		httpClient: httpClient,
 	}, nil
 }
 
