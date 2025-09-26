@@ -51,7 +51,7 @@ dns:
   provider: "cloudflare"
   domain: "example.com"
   zone_id: "your-zone-id"
-  
+
   cloudflare:
     api_token: "your-cloudflare-api-token"
 
@@ -184,8 +184,43 @@ For a device named `web-server` in domain `example.com`:
 ### Route53 Setup
 
 1. Ensure you have AWS credentials configured (via AWS CLI, environment variables, or IAM roles)
-2. Get the Hosted Zone ID from the Route53 console
-3. Ensure your AWS credentials have permissions to manage DNS records in the zone
+
+    a. If using AWS environment variables the AWS sdk looks for `AWS_ACCESS_KEY_ID` and  `AWS_SECRET_ACCESS_KEY`.
+
+1. Get the Hosted Zone ID from the Route53 console
+
+1. Ensure your AWS credentials have permissions to manage DNS records in the zone
+
+    ```json
+    {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "AllowDNSZoneAccess",
+                "Effect": "Allow",
+                "Action": [
+                    "route53:GetChange",
+                    "route53:GetHostedZone",
+                    "route53:ChangeResourceRecordSets",
+                    "route53:ListResourceRecordSets"
+                ],
+                "Resource": [
+                    "arn:aws:route53:::change/*",
+                    "arn:aws:route53:::hostedzone/<your-zone-id>"
+                ]
+            },
+            {
+                "Sid": "ListZones",
+                "Effect": "Allow",
+                "Action": [
+                    "route53:ListHostedZonesByName",
+                    "route53:ListHostedZones"
+                ],
+                "Resource": "*"
+            }
+        ]
+    }
+    ```
 
 ## Tag Filtering
 
