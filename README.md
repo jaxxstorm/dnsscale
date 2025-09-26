@@ -268,8 +268,4 @@ nslookup web-server.example.com
 
 ## License
 
-[Add your license information here]
-
-## Support
-
-[Add support/contact information here]
+MIT

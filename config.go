@@ -30,9 +30,10 @@ type TailscaleConfig struct {
 type DNSConfig struct {
 	Provider   string           `mapstructure:"provider" yaml:"provider"`
 	Domain     string           `mapstructure:"domain" yaml:"domain"`
-	ZoneID     string           `mapstructure:"zone_id" yaml:"zone_id"`
+	ZoneID     string           `mapstructure:"zone_id" yaml:"zone_id,omitempty"`
 	Route53    Route53Config    `mapstructure:"route53" yaml:"route53,omitempty"`
 	Cloudflare CloudflareConfig `mapstructure:"cloudflare" yaml:"cloudflare,omitempty"`
+	Pihole     PiholeConfig     `mapstructure:"pihole" yaml:"pihole,omitempty"`
 }
 
 // Route53Config holds AWS Route53 specific configuration
@@ -45,6 +46,12 @@ type Route53Config struct {
 
 // CloudflareConfig holds Cloudflare specific configuration
 type CloudflareConfig struct {
+	APIToken string `mapstructure:"api_token" yaml:"api_token"`
+}
+
+// PiholeConfig holds Pi-hole specific configuration
+type PiholeConfig struct {
+	BaseURL  string `mapstructure:"base_url" yaml:"base_url"`
 	APIToken string `mapstructure:"api_token" yaml:"api_token"`
 }
 
@@ -78,20 +85,30 @@ func (c *Config) Validate() error {
 	if c.DNS.Domain == "" {
 		return fmt.Errorf("dns.domain is required")
 	}
-	if c.DNS.ZoneID == "" {
-		return fmt.Errorf("dns.zone_id is required")
-	}
 
 	// Provider-specific validation
 	switch c.DNS.Provider {
 	case "route53":
+		if c.DNS.ZoneID == "" {
+			return fmt.Errorf("dns.zone_id is required for route53 provider")
+		}
 		// Route53 validation - credentials are typically handled via AWS SDK
 	case "cloudflare":
+		if c.DNS.ZoneID == "" {
+			return fmt.Errorf("dns.zone_id is required for cloudflare provider")
+		}
 		if c.DNS.Cloudflare.APIToken == "" {
 			return fmt.Errorf("dns.cloudflare.api_token is required when using cloudflare provider")
 		}
+	case "pihole":
+		if c.DNS.Pihole.BaseURL == "" {
+			return fmt.Errorf("dns.pihole.base_url is required when using pihole provider")
+		}
+		if c.DNS.Pihole.APIToken == "" {
+			return fmt.Errorf("dns.pihole.api_token is required when using pihole provider")
+		}
 	default:
-		return fmt.Errorf("unsupported dns provider: %s (supported: route53, cloudflare)", c.DNS.Provider)
+		return fmt.Errorf("unsupported dns provider: %s (supported: route53, cloudflare, pihole)", c.DNS.Provider)
 	}
 
 	// Validate app configuration
