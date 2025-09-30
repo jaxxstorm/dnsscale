@@ -1,0 +1,11 @@
+[Unit]
+Description=dnsscale service
+After=network.target
+
+[Service]
+Environment="PATH=/bin:/usr/bin:/usr/local/bin:%h/.local/bin:%h/go/bin"
+EnvironmentFile=%h/dnsscale.env
+ExecStart=%h/go/bin/dnsscale
+
+[Install]
+WantedBy=default.target
