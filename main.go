@@ -494,8 +494,10 @@ func createDNSProvider(ctx context.Context, config *Config, logger *zap.Logger) 
 		if config.DNS.Pihole.BaseURL == "" || config.DNS.Pihole.APIToken == "" {
 			return nil, fmt.Errorf("pi-hole base URL and API token are required when using pihole provider")
 		}
-		logger.Info("Initializing Pi-hole DNS provider", zap.String("base_url", config.DNS.Pihole.BaseURL))
-		return providers.NewPiholeProvider(config.DNS.Pihole.BaseURL, config.DNS.Pihole.APIToken)
+		logger.Info("Initializing Pi-hole DNS provider",
+			zap.String("base_url", config.DNS.Pihole.BaseURL),
+			zap.Bool("tls_insecure_skip_verify", config.DNS.Pihole.TLSInsecureSkipVerify))
+		return providers.NewPiholeProvider(config.DNS.Pihole.BaseURL, config.DNS.Pihole.APIToken, config.DNS.Pihole.TLSInsecureSkipVerify)
 	default:
 		return nil, fmt.Errorf("unsupported DNS provider: %s", config.DNS.Provider)
 	}

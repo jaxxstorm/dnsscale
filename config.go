@@ -51,8 +51,9 @@ type CloudflareConfig struct {
 
 // PiholeConfig holds Pi-hole specific configuration
 type PiholeConfig struct {
-	BaseURL  string `mapstructure:"base_url" yaml:"base_url"`
-	APIToken string `mapstructure:"api_token" yaml:"api_token"`
+	BaseURL           string `mapstructure:"base_url" yaml:"base_url"`
+	APIToken          string `mapstructure:"api_token" yaml:"api_token"`
+	TLSInsecureSkipVerify bool   `mapstructure:"tls_insecure_skip_verify" yaml:"tls_insecure_skip_verify,omitempty"`
 }
 
 // AppConfig holds general application configuration
