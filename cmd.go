@@ -40,6 +40,11 @@ func Execute() {
 func init() {
 	cobra.OnInitialize(initConfig)
 
+	// A runtime failure is not a usage error. Without this, every failed API
+	// call prints the full help text, which under a restart loop fills the
+	// container log with usage blocks instead of the actual error.
+	rootCmd.SilenceUsage = true
+
 	// Global flags
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.dnsscale.yaml)")
 
