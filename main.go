@@ -186,6 +186,15 @@ type DNSReconciler struct {
 	pollInterval time.Duration
 	annotations  map[string]string // For filtering based on tags
 	logger       *zap.Logger
+
+	// aliases maps a node name to the additional names it should own.
+	aliases map[string][]string
+	// tagAliases maps a Tailscale tag to a name that any node carrying the tag
+	// should own.
+	tagAliases map[string]string
+	// static holds records that belong to the configuration rather than to a
+	// node.
+	static []StaticRecord
 }
 
 func NewDNSReconciler(ts *TailscaleClient, dns providers.DNSProvider, domain string, pollInterval time.Duration, logger *zap.Logger) *DNSReconciler {
@@ -198,7 +207,52 @@ func NewDNSReconciler(ts *TailscaleClient, dns providers.DNSProvider, domain str
 		pollInterval: pollInterval,
 		annotations:  make(map[string]string),
 		logger:       logger,
+		aliases:      make(map[string][]string),
+		tagAliases:   make(map[string]string),
 	}
+}
+
+// RunOnce performs a single reconciliation pass and returns. Unlike the polling
+// loop it works from a complete picture of the tailnet, so it also reclaims
+// records left behind by earlier runs and applies the static record table.
+func (r *DNSReconciler) RunOnce(ctx context.Context) error {
+	nodes, err := r.tailscale.ListNodes(ctx)
+	if err != nil {
+		return fmt.Errorf("list Tailscale nodes: %w", err)
+	}
+
+	r.cacheMutex.Lock()
+	for _, node := range nodes {
+		r.nodeCache[node.ID] = node
+	}
+	r.cacheMutex.Unlock()
+
+	var failures []error
+	managed := 0
+	for _, node := range nodes {
+		if !r.shouldManageNode(node) {
+			r.logger.Debug("Skipping node due to tag filters",
+				zap.String("node_name", node.Name),
+				zap.Strings("node_tags", node.Tags))
+			continue
+		}
+		managed++
+
+		if err := r.reconcile(ctx, node.ID); err != nil {
+			failures = append(failures, fmt.Errorf("node %s: %w", node.Name, err))
+		}
+	}
+
+	if err := r.sweep(ctx); err != nil {
+		failures = append(failures, fmt.Errorf("sweep: %w", err))
+	}
+
+	r.logger.Info("Single reconciliation pass complete",
+		zap.Int("nodes_total", len(nodes)),
+		zap.Int("nodes_managed", managed),
+		zap.Int("failures", len(failures)))
+
+	return errors.Join(failures...)
 }
 
 // Run starts the reconciliation loop
@@ -237,6 +291,15 @@ func (r *DNSReconciler) watchTailscale(ctx context.Context) {
 
 	// Initial sync
 	r.syncNodes(ctx)
+
+	// Sweep once at startup, which is where the whole-zone view is worth paying
+	// for: it applies the static records and reclaims anything left behind by a
+	// previous run. It deliberately does not run on every tick - steady-state
+	// deletion is handled by the per-node delete path, and sweeping alongside
+	// the workers would race with it over the same records.
+	if err := r.sweep(ctx); err != nil {
+		r.logger.Error("Initial zone sweep failed", zap.Error(err))
+	}
 
 	for {
 		select {
@@ -335,61 +398,23 @@ func (r *DNSReconciler) reconcile(ctx context.Context, key string) error {
 		return nil
 	}
 
-	// Create DNS records for the node
-	recordName := fmt.Sprintf("%s.%s", node.Name, r.domain)
-
-	for _, addr := range node.Addresses {
-		recordType := "A"
-		if strings.Contains(addr, ":") {
-			recordType = "AAAA"
-		}
-
-		record := providers.DNSRecord{
-			Name:  recordName,
-			Type:  recordType,
-			Value: addr,
-			TTL:   300,
-		}
-
+	// Write the address records and the ownership marker for every name this
+	// node owns - its own, plus any aliases and tag-derived names.
+	for _, record := range r.recordsForNode(node) {
 		if err := r.dnsProvider.UpdateRecord(ctx, r.domain, record); err != nil {
-			return fmt.Errorf("failed to update DNS record: %w", err)
+			// The ownership marker is what makes cleanup possible, so a failure
+			// to write it must not be treated as success.
+			return fmt.Errorf("update %s %s: %w", record.Type, record.Name, err)
 		}
 
 		r.logger.Info("Updated DNS record",
-			zap.String("record_type", recordType),
+			zap.String("record_type", record.Type),
 			zap.String("record_name", record.Name),
-			zap.String("record_value", addr),
+			zap.String("record_value", record.Value),
 			zap.String("node_name", node.Name))
 	}
 
-	// Create TXT ownership record to indicate this record is managed by dnsscale.
-	// The value is stored unquoted; quoting is a wire-format detail that each
-	// provider applies for itself when talking to its API.
-	txtRecord := providers.DNSRecord{
-		Name:  recordName,
-		Type:  "TXT",
-		Value: ownershipValue(node.ID),
-		TTL:   300,
-	}
-
-	if err := r.dnsProvider.UpdateRecord(ctx, r.domain, txtRecord); err != nil {
-		r.logger.Warn("Failed to create TXT ownership record",
-			zap.String("record_name", txtRecord.Name),
-			zap.Error(err))
-		// Don't fail the entire reconciliation if TXT record fails
-	} else {
-		r.logger.Info("Updated TXT ownership record",
-			zap.String("record_name", txtRecord.Name),
-			zap.String("record_value", txtRecord.Value))
-	}
-
 	return nil
-}
-
-// ownershipValue builds the TXT payload that marks a record name as managed by
-// dnsscale on behalf of a specific Tailscale node.
-func ownershipValue(nodeID string) string {
-	return fmt.Sprintf("dnsscale-managed node_id=%s", nodeID)
 }
 
 // deleteNodeDNS removes DNS records for a deleted node. Ownership is recovered
@@ -404,11 +429,17 @@ func (r *DNSReconciler) deleteNodeDNS(ctx context.Context, nodeID string) error 
 	// Collect every name this node owns before deleting anything. A node can own
 	// more than one name, so this has to scan the whole list rather than stop at
 	// the first ownership record it sees.
-	marker := fmt.Sprintf("node_id=%s", nodeID)
+	//
+	// The owner is compared exactly rather than by substring: node IDs are not
+	// self-delimiting, so a substring match would let the ID "abc" claim records
+	// belonging to "abcdef".
 	owned := make(map[string]bool)
 	for _, record := range records {
-		if record.Type == "TXT" && strings.Contains(record.Value, marker) {
-			owned[record.Name] = true
+		if record.Type != "TXT" {
+			continue
+		}
+		if owner, ok := ownerFromValue(record.Value); ok && owner == nodeID {
+			owned[normalizeName(record.Name)] = true
 		}
 	}
 
@@ -421,7 +452,7 @@ func (r *DNSReconciler) deleteNodeDNS(ctx context.Context, nodeID string) error 
 	// Delete every record (A, AAAA, TXT) sitting under an owned name.
 	var failures []error
 	for _, recordToDelete := range records {
-		if !owned[recordToDelete.Name] {
+		if !owned[normalizeName(recordToDelete.Name)] {
 			continue
 		}
 
@@ -550,6 +581,11 @@ func runDNSScale(config *Config) error {
 		logger.Fatal("Failed to initialize DNS provider", zap.Error(err))
 	}
 
+	if config.App.DryRun {
+		logger.Info("Dry run: no DNS changes will be applied")
+		dnsProvider = newDryRunProvider(dnsProvider, logger)
+	}
+
 	// Create and run reconciler
 	reconciler := NewDNSReconciler(tsClient, dnsProvider, config.DNS.Domain, config.App.PollInterval, logger)
 
@@ -557,6 +593,41 @@ func runDNSScale(config *Config) error {
 	for _, tag := range config.App.RequiredTags {
 		reconciler.annotations[tag] = "true"
 		logger.Info("Added required tag filter", zap.String("tag", tag))
+	}
+
+	if len(config.App.RequiredTags) == 0 {
+		logger.Warn("No required tags configured: every authorized device in the tailnet " +
+			"will be published, including personal devices")
+	}
+
+	for node, aliases := range config.DNS.Aliases {
+		reconciler.aliases[node] = aliases
+		logger.Info("Configured node aliases",
+			zap.String("node_name", node),
+			zap.Strings("aliases", aliases))
+	}
+
+	for tag, name := range config.DNS.TagAliases {
+		reconciler.tagAliases[tag] = name
+		logger.Info("Configured tag alias",
+			zap.String("tag", tag),
+			zap.String("name", name))
+	}
+
+	reconciler.static = config.DNS.StaticRecords
+	for _, rec := range config.DNS.StaticRecords {
+		logger.Info("Configured static record",
+			zap.String("record_name", qualify(rec.Name, config.DNS.Domain)),
+			zap.String("record_type", rec.Type),
+			zap.String("record_value", rec.Value))
+	}
+
+	if config.App.Once {
+		if err := reconciler.RunOnce(ctx); err != nil {
+			logger.Error("Single reconciliation pass reported failures", zap.Error(err))
+			return err
+		}
+		return nil
 	}
 
 	if err := reconciler.Run(ctx, config.App.Workers); err != nil {

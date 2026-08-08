@@ -261,6 +261,91 @@ app:
 
 Only devices with these tags will have DNS records created.
 
+> **An empty `required_tags` list means every authorized device in the tailnet gets a DNS record.**
+>
+> That includes personal laptops and phones, and it publishes their hostnames
+> and Tailscale addresses into whatever zone you configured — often a public
+> one. Anyone can then enumerate your tailnet's device names by querying DNS.
+>
+> Because that is a bad state to arrive at by forgetting to set a filter,
+> dnsscale refuses to start with an empty filter unless you confirm it:
+>
+> ```yaml
+> app:
+>   manage_all_nodes: true
+> ```
+
+## Aliases
+
+A node can own additional names. Alias records point at the same addresses as
+the node and carry the same ownership marker, so they are reclaimed along with
+it when the node disappears.
+
+```yaml
+dns:
+  aliases:
+    fresno:
+      - music
+      - mealie
+      - memory
+```
+
+Names are relative to `dns.domain` unless they already end with it, so `music`
+and `music.example.com` mean the same thing.
+
+### Tag-derived names
+
+Where each service runs its own Tailscale sidecar with `--advertise-tags`, a tag
+can supply the name directly, which avoids maintaining an alias table at all:
+
+```yaml
+dns:
+  tag_aliases:
+    "tag:music": music
+    "tag:mealie": mealie
+```
+
+Any managed node carrying `tag:music` gets `music.example.com` pointing at *that
+node's* addresses. If several nodes carry the same tag they will fight over the
+name, so a tag used this way should identify exactly one node.
+
+## Static Records
+
+Records that are not derived from any node — most usefully a wildcard:
+
+```yaml
+dns:
+  static_records:
+    - name: "*"
+      value: "100.64.0.1"
+    - name: "vpn"
+      type: "CNAME"
+      value: "gateway.example.com"
+```
+
+`name` is relative to `dns.domain`; `*` is the wildcard and `@` the zone apex.
+`type` defaults to `A`, or `AAAA` when the value looks like an IPv6 address.
+These records carry an ownership marker too, so removing one from the
+configuration causes it to be reclaimed on the next start.
+
+## Dry Runs and One-shot Mode
+
+```bash
+# Show what would change without touching the zone
+./dnsscale --dry-run --once
+
+# Reconcile once and exit, e.g. from a systemd timer or a cron job
+./dnsscale --once
+```
+
+`--dry-run` passes reads through to the real provider and logs every write it
+would have made, so the output reflects the actual state of your zone.
+
+`--once` performs a single full pass and returns, rather than polling. Unlike
+the polling loop it works from a complete picture of the tailnet, so it also
+reclaims records left behind by earlier runs and applies the static record
+table. The polling loop runs the same sweep once at startup.
+
 ## Logging
 
 DNSScale provides structured logging with configurable levels:

@@ -197,3 +197,5 @@ func TestDeleteNodeDNSUnknownNodeIsNoOp(t *testing.T) {
 		t.Fatalf("expected nothing deleted, got %v", fake.names())
 	}
 }
+
+func zapNop() *zap.Logger { return zap.NewNop() }

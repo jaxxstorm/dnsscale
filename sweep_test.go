@@ -1,0 +1,152 @@
+package main
+
+import (
+	"context"
+	"slices"
+	"testing"
+
+	"github.com/jaxxstorm/dnsscale/providers"
+)
+
+func TestSweepWritesStaticRecords(t *testing.T) {
+	fake := newFakeProvider()
+	r := testReconciler(t, fake)
+	r.static = []StaticRecord{{Name: "*", Type: "A", Value: "100.64.0.1", TTL: 300}}
+
+	if err := r.sweep(context.Background()); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	got := fake.names()
+	want := []string{"A *.example.com", "TXT *.example.com"}
+	if !slices.Equal(got, want) {
+		t.Errorf("after sweep: %v, want %v", got, want)
+	}
+}
+
+func TestSweepUpdatesDriftedStaticRecord(t *testing.T) {
+	fake := newFakeProvider(
+		providers.DNSRecord{Name: "*.example.com", Type: "A", Value: "10.0.0.1", TTL: 300},
+		providers.DNSRecord{Name: "*.example.com", Type: "TXT", Value: ownershipValue(ownerStatic), TTL: 300},
+	)
+	r := testReconciler(t, fake)
+	r.static = []StaticRecord{{Name: "*", Type: "A", Value: "100.64.0.1", TTL: 300}}
+
+	if err := r.sweep(context.Background()); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	for _, rec := range fake.records {
+		if rec.Type == "A" && rec.Value != "100.64.0.1" {
+			t.Errorf("static A record still %q, want the configured value", rec.Value)
+		}
+	}
+}
+
+// Records left behind by a node that no longer exists - which is exactly the
+// state the broken delete path used to produce - must be reclaimed.
+func TestSweepReclaimsRecordsOfVanishedNode(t *testing.T) {
+	var records []providers.DNSRecord
+	records = append(records, nodeRecords("gone.example.com", "old-node", "100.64.0.9")...)
+	records = append(records, nodeRecords("live.example.com", "live-node", "100.64.0.1")...)
+	fake := newFakeProvider(records...)
+
+	r := testReconciler(t, fake)
+	r.nodeCache["live-node"] = TailscaleNode{
+		ID:        "live-node",
+		Name:      "live",
+		Addresses: []string{"100.64.0.1"},
+	}
+
+	if err := r.sweep(context.Background()); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	got := fake.names()
+	want := []string{"A live.example.com", "TXT live.example.com"}
+	if !slices.Equal(got, want) {
+		t.Errorf("after sweep: %v, want %v", got, want)
+	}
+}
+
+// An alias removed from the configuration should be reclaimed even though the
+// node that owned it is still present.
+func TestSweepReclaimsDroppedAlias(t *testing.T) {
+	var records []providers.DNSRecord
+	records = append(records, nodeRecords("fresno.example.com", "n1", "100.64.0.1")...)
+	records = append(records, nodeRecords("oldalias.example.com", "n1", "100.64.0.1")...)
+	fake := newFakeProvider(records...)
+
+	r := testReconciler(t, fake)
+	r.nodeCache["n1"] = TailscaleNode{ID: "n1", Name: "fresno", Addresses: []string{"100.64.0.1"}}
+
+	if err := r.sweep(context.Background()); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	got := fake.names()
+	want := []string{"A fresno.example.com", "TXT fresno.example.com"}
+	if !slices.Equal(got, want) {
+		t.Errorf("after sweep: %v, want %v", got, want)
+	}
+}
+
+// Anything without a dnsscale ownership marker belongs to someone else and must
+// survive untouched.
+func TestSweepLeavesUnmanagedRecordsAlone(t *testing.T) {
+	fake := newFakeProvider(
+		providers.DNSRecord{Name: "www.example.com", Type: "A", Value: "203.0.113.1", TTL: 300},
+		providers.DNSRecord{Name: "example.com", Type: "TXT", Value: "v=spf1 -all", TTL: 300},
+		providers.DNSRecord{Name: "mail.example.com", Type: "A", Value: "203.0.113.2", TTL: 300},
+	)
+	before := fake.names()
+
+	r := testReconciler(t, fake)
+
+	if err := r.sweep(context.Background()); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	if got := fake.names(); !slices.Equal(got, before) {
+		t.Errorf("sweep touched unmanaged records: %v, want %v", got, before)
+	}
+}
+
+// A node that stops matching the tag filter should have its records reclaimed
+// rather than left dangling.
+func TestSweepReclaimsNodeThatNoLongerMatchesFilter(t *testing.T) {
+	fake := newFakeProvider(nodeRecords("laptop.example.com", "n1", "100.64.0.5")...)
+
+	r := testReconciler(t, fake)
+	r.annotations["tag:server"] = "true"
+	r.nodeCache["n1"] = TailscaleNode{
+		ID:        "n1",
+		Name:      "laptop",
+		Addresses: []string{"100.64.0.5"},
+		Tags:      []string{"tag:personal"},
+	}
+
+	if err := r.sweep(context.Background()); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	if len(fake.records) != 0 {
+		t.Errorf("expected records reclaimed for filtered-out node, got %v", fake.names())
+	}
+}
+
+func TestDryRunProviderMakesNoChanges(t *testing.T) {
+	fake := newFakeProvider(nodeRecords("gone.example.com", "old-node", "100.64.0.9")...)
+	before := fake.names()
+
+	r := testReconciler(t, newDryRunProvider(fake, zapNop()))
+	r.static = []StaticRecord{{Name: "*", Type: "A", Value: "100.64.0.1", TTL: 300}}
+
+	if err := r.sweep(context.Background()); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	if got := fake.names(); !slices.Equal(got, before) {
+		t.Errorf("dry run modified the zone: %v, want %v", got, before)
+	}
+}

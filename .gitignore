@@ -1,0 +1,22 @@
+# Compiled binary (shares its name with the repository directory)
+/dnsscale
+
+# Local tool configuration. mise.local.toml routinely holds real API keys and
+# cloud credentials - keep it out of the repository.
+mise.local.toml
+mise.local.*.toml
+
+# Environment files
+.env
+.env.*
+
+# Generated configuration. dnsscale.yaml and the generated example both hold
+# API tokens once filled in.
+dnsscale.example.yaml
+dnsscale.local.yaml
+
+# Editor and OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/

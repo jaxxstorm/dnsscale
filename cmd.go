@@ -63,6 +63,9 @@ func init() {
 	rootCmd.PersistentFlags().Int("workers", 2, "Number of worker goroutines")
 	rootCmd.PersistentFlags().Duration("poll-interval", 0, "Interval to poll Tailscale API (e.g., 30s, 1m)")
 	rootCmd.PersistentFlags().StringSlice("required-tags", []string{}, "Only manage nodes with these tags")
+	rootCmd.PersistentFlags().Bool("manage-all-nodes", false, "Manage every authorized device when required-tags is empty")
+	rootCmd.PersistentFlags().Bool("once", false, "Run a single reconciliation pass and exit")
+	rootCmd.PersistentFlags().Bool("dry-run", false, "Log the changes that would be made without applying them")
 
 	// Logging flags
 	rootCmd.PersistentFlags().String("log-level", "", "Log level (debug, info, warn, error)")
@@ -82,6 +85,9 @@ func init() {
 	viper.BindPFlag("app.workers", rootCmd.PersistentFlags().Lookup("workers"))
 	viper.BindPFlag("app.poll_interval", rootCmd.PersistentFlags().Lookup("poll-interval"))
 	viper.BindPFlag("app.required_tags", rootCmd.PersistentFlags().Lookup("required-tags"))
+	viper.BindPFlag("app.manage_all_nodes", rootCmd.PersistentFlags().Lookup("manage-all-nodes"))
+	viper.BindPFlag("app.once", rootCmd.PersistentFlags().Lookup("once"))
+	viper.BindPFlag("app.dry_run", rootCmd.PersistentFlags().Lookup("dry-run"))
 	viper.BindPFlag("logging.level", rootCmd.PersistentFlags().Lookup("log-level"))
 	viper.BindPFlag("logging.format", rootCmd.PersistentFlags().Lookup("log-format"))
 
@@ -124,6 +130,9 @@ var envBindings = map[string]string{
 	"app.workers":              "APP_WORKERS",
 	"app.poll_interval":        "APP_POLL_INTERVAL",
 	"app.required_tags":        "APP_REQUIRED_TAGS",
+	"app.manage_all_nodes":     "APP_MANAGE_ALL_NODES",
+	"app.once":                 "APP_ONCE",
+	"app.dry_run":              "APP_DRY_RUN",
 	"logging.level":            "LOGGING_LEVEL",
 	"logging.format":           "LOGGING_FORMAT",
 }
@@ -225,16 +234,49 @@ dns:
     # Pi-hole API token (get from Settings > API/Web interface > Show API token)
     api_token: "your-pihole-api-token"
 
+  # Additional names for a node, keyed by Tailscale node name. Each alias points
+  # at the same addresses as the node and carries the same ownership marker, so
+  # aliases are reclaimed when the node is removed.
+  # aliases:
+  #   fresno:
+  #     - music
+  #     - mealie
+
+  # Derive a name from a tag. Any managed node carrying the tag gets the name,
+  # pointing at that node's own addresses. Useful when each service runs its own
+  # Tailscale sidecar with --advertise-tags.
+  # tag_aliases:
+  #   "tag:music": music
+
+  # Records dnsscale owns that are not derived from any node. The type defaults
+  # to A, or AAAA when the value looks like an IPv6 address.
+  # static_records:
+  #   - name: "*"
+  #     value: "100.64.0.1"
+  #   - name: "vpn"
+  #     type: "CNAME"
+  #     value: "gateway.example.com"
+
 app:
   # Number of worker goroutines for processing DNS updates
   workers: 2
   # How often to poll Tailscale API for changes
   poll_interval: "30s"
-  # Only manage nodes with these tags (optional)
-  # If empty, all nodes will be managed
+  # Only manage nodes with these tags.
+  #
+  # An empty list means EVERY authorized device in the tailnet gets a DNS
+  # record, including personal laptops and phones. If that is really what you
+  # want, set manage_all_nodes below to confirm it; otherwise list the tags that
+  # identify the machines you want published.
   required_tags:
     - "tag:production"
     - "tag:webserver"
+  # manage_all_nodes: false
+
+  # Run a single reconciliation pass and exit instead of polling.
+  # once: false
+  # Log the changes that would be made without applying any of them.
+  # dry_run: false
 
 logging:
   # Log level: debug, info, warn, error

@@ -85,6 +85,7 @@ func TestProviderCredentialsFromEnv(t *testing.T) {
 	t.Setenv("AWS_REGION", "us-west-2")
 	t.Setenv("PIHOLE_BASE_URL", "http://pihole.local")
 	t.Setenv("PIHOLE_API_TOKEN", "ph-token")
+	t.Setenv("APP_REQUIRED_TAGS", "tag:server")
 
 	bindEnvVars()
 	viper.AutomaticEnv()
