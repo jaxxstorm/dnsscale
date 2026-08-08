@@ -13,6 +13,8 @@ import (
 	"github.com/jaxxstorm/dnsscale/providers"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/clientcredentials"
 	"k8s.io/client-go/util/workqueue"
 )
 
@@ -87,8 +89,18 @@ func (d *TailscaleDevice) ToTailscaleNode() TailscaleNode {
 	}
 }
 
+// tailscaleTokenURL is the OAuth token endpoint for the Tailscale API.
+const tailscaleTokenURL = "https://api.tailscale.com/api/v2/oauth/token"
+
+// defaultOAuthScopes is the minimum this tool needs. dnsscale only ever issues
+// GET /api/v2/tailnet/{tailnet}/devices, so read access to devices is enough -
+// there is no reason to grant an OAuth client anything wider.
+var defaultOAuthScopes = []string{"devices:core:read"}
+
 // TailscaleClient handles Tailscale API interactions
 type TailscaleClient struct {
+	// apiKey is empty when authenticating with an OAuth client, in which case
+	// httpClient attaches the bearer token itself.
 	apiKey     string
 	tailnet    string
 	logger     *zap.Logger
@@ -106,6 +118,61 @@ func NewTailscaleClient(apiKey, tailnet string, logger *zap.Logger) *TailscaleCl
 	}
 }
 
+// NewTailscaleOAuthClient builds a client that authenticates with an OAuth
+// client using the client credentials flow. The returned HTTP client fetches an
+// access token on first use and refreshes it automatically when it expires, so
+// unlike an API key this does not go stale after 90 days.
+func NewTailscaleOAuthClient(ctx context.Context, clientID, clientSecret, tailnet string, scopes []string, logger *zap.Logger) *TailscaleClient {
+	return newTailscaleOAuthClient(ctx, clientID, clientSecret, tailnet, tailscaleTokenURL, scopes, logger)
+}
+
+// newTailscaleOAuthClient is NewTailscaleOAuthClient with the token endpoint
+// injectable, so tests can point the exchange at a stub server.
+func newTailscaleOAuthClient(ctx context.Context, clientID, clientSecret, tailnet, tokenURL string, scopes []string, logger *zap.Logger) *TailscaleClient {
+	if len(scopes) == 0 {
+		scopes = defaultOAuthScopes
+	}
+
+	cfg := &clientcredentials.Config{
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		TokenURL:     tokenURL,
+		Scopes:       scopes,
+	}
+
+	// Bound the underlying transport the same way the API-key path is bounded;
+	// oauth2 reuses this client for the token exchange as well.
+	base := &http.Client{Timeout: 30 * time.Second}
+	httpClient := cfg.Client(context.WithValue(ctx, oauth2.HTTPClient, base))
+	httpClient.Timeout = 30 * time.Second
+
+	return &TailscaleClient{
+		tailnet:    tailnet,
+		logger:     logger,
+		httpClient: httpClient,
+		baseURL:    "https://api.tailscale.com",
+	}
+}
+
+// NewTailscaleClientFromConfig selects the authentication method the
+// configuration asks for. Validate() has already ensured exactly one is set.
+func NewTailscaleClientFromConfig(ctx context.Context, cfg *TailscaleConfig, logger *zap.Logger) *TailscaleClient {
+	if cfg.UsesOAuth() {
+		scopes := cfg.OAuthScopes
+		if len(scopes) == 0 {
+			scopes = defaultOAuthScopes
+		}
+		logger.Info("Authenticating to Tailscale with an OAuth client",
+			zap.String("client_id", cfg.OAuthClientID),
+			zap.Strings("scopes", scopes))
+		return NewTailscaleOAuthClient(ctx, cfg.OAuthClientID, cfg.OAuthClientSecret, cfg.Tailnet, cfg.OAuthScopes, logger)
+	}
+
+	logger.Warn("Authenticating to Tailscale with an API key. These expire 90 days after creation, " +
+		"after which reconciliation stops silently. Consider an OAuth client instead.")
+	return NewTailscaleClient(cfg.APIKey, cfg.Tailnet, logger)
+}
+
 func (t *TailscaleClient) ListNodes(ctx context.Context) ([]TailscaleNode, error) {
 	// URL encode the tailnet name to handle email addresses and special characters
 	encodedTailnet := url.QueryEscape(t.tailnet)
@@ -121,8 +188,11 @@ func (t *TailscaleClient) ListNodes(ctx context.Context) ([]TailscaleNode, error
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Set authentication header
-	req.Header.Set("Authorization", "Bearer "+t.apiKey)
+	// Set authentication header. With an OAuth client the token is attached by
+	// the HTTP client's transport, so setting it here would overwrite it.
+	if t.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+t.apiKey)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "dnsscale/1.0")
 
@@ -135,6 +205,15 @@ func (t *TailscaleClient) ListNodes(ctx context.Context) ([]TailscaleNode, error
 
 	// Check for API errors
 	if resp.StatusCode != http.StatusOK {
+		// 401 against an API key is overwhelmingly an expired key rather than a
+		// wrong one, and the generic status text gives no hint of that. Say so:
+		// otherwise this failure mode looks like a transient error forever while
+		// the zone silently stops being reconciled.
+		if resp.StatusCode == http.StatusUnauthorized && t.apiKey != "" {
+			return nil, fmt.Errorf("API request failed with status %d: %s "+
+				"(Tailscale API keys expire 90 days after creation - if this worked before, the key has likely expired; "+
+				"an OAuth client does not expire)", resp.StatusCode, resp.Status)
+		}
 		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, resp.Status)
 	}
 
@@ -520,7 +599,7 @@ func runDNSScale(config *Config) error {
 	ctx := context.Background()
 
 	// Initialize Tailscale client
-	tsClient := NewTailscaleClient(config.Tailscale.APIKey, config.Tailscale.Tailnet, logger)
+	tsClient := NewTailscaleClientFromConfig(ctx, &config.Tailscale, logger)
 
 	// Initialize DNS provider
 	dnsProvider, err := createDNSProvider(ctx, config, logger)

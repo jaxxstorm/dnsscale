@@ -45,6 +45,8 @@ func init() {
 	// Tailscale flags
 	rootCmd.PersistentFlags().String("tailscale-api-key", "", "Tailscale API key")
 	rootCmd.PersistentFlags().String("tailscale-tailnet", "", "Tailscale tailnet name")
+	rootCmd.PersistentFlags().String("tailscale-oauth-client-id", "", "Tailscale OAuth client ID (preferred over an API key; API keys expire after 90 days)")
+	rootCmd.PersistentFlags().String("tailscale-oauth-client-secret", "", "Tailscale OAuth client secret")
 
 	// DNS flags
 	rootCmd.PersistentFlags().String("dns-provider", "", "DNS provider (route53, cloudflare, or pihole)")
@@ -70,6 +72,8 @@ func init() {
 	// Bind flags to viper
 	viper.BindPFlag("tailscale.api_key", rootCmd.PersistentFlags().Lookup("tailscale-api-key"))
 	viper.BindPFlag("tailscale.tailnet", rootCmd.PersistentFlags().Lookup("tailscale-tailnet"))
+	viper.BindPFlag("tailscale.oauth_client_id", rootCmd.PersistentFlags().Lookup("tailscale-oauth-client-id"))
+	viper.BindPFlag("tailscale.oauth_client_secret", rootCmd.PersistentFlags().Lookup("tailscale-oauth-client-secret"))
 	viper.BindPFlag("dns.provider", rootCmd.PersistentFlags().Lookup("dns-provider"))
 	viper.BindPFlag("dns.domain", rootCmd.PersistentFlags().Lookup("dns-domain"))
 	viper.BindPFlag("dns.zone_id", rootCmd.PersistentFlags().Lookup("dns-zone-id"))
@@ -87,6 +91,8 @@ func init() {
 	// Bind environment variables
 	viper.BindEnv("tailscale.api_key", "TAILSCALE_API_KEY")
 	viper.BindEnv("tailscale.tailnet", "TAILSCALE_TAILNET")
+	viper.BindEnv("tailscale.oauth_client_id", "TAILSCALE_OAUTH_CLIENT_ID")
+	viper.BindEnv("tailscale.oauth_client_secret", "TAILSCALE_OAUTH_CLIENT_SECRET")
 	viper.BindEnv("dns.zone_id", "DNS_ZONE_ID")
 	viper.BindEnv("dns.domain", "DNS_DOMAIN")
 	viper.BindEnv("dns.cloudflare.api_token", "CLOUDFLARE_API_TOKEN")
@@ -161,6 +167,15 @@ func generateExampleConfig(outputFile string) error {
 # This is an example configuration file showing all available options
 
 tailscale:
+  # Authenticate with EITHER an OAuth client (preferred) or an API key.
+  #
+  # OAuth clients do not expire; API keys stop working 90 days after creation,
+  # and when that happens dnsscale keeps polling and silently stops reconciling.
+  # Create one at https://login.tailscale.com/admin/settings/oauth with the
+  # devices:core:read scope - that is all dnsscale needs.
+  # oauth_client_id: "k123456CNTRL"
+  # oauth_client_secret: "tskey-client-xxxxx"
+
   # Tailscale API key - get this from https://login.tailscale.com/admin/settings/keys
   api_key: "tskey-api-xxxxx"
   # Your tailnet name (e.g., example.ts.net or example@gmail.com)
