@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -277,6 +278,8 @@ type DNSReconciler struct {
 	// prune enables deleting records whose owner no longer exists. Off unless
 	// explicitly requested.
 	prune bool
+	// protected names are never reclaimed, whatever the ownership markers say.
+	protected protectedMatcher
 	// dryRun suppresses the "this happened" log lines. The provider already
 	// reports what it would have done, and claiming a change was applied when
 	// it was not is worse than saying nothing.
@@ -338,7 +341,30 @@ func (r *DNSReconciler) RunOnce(ctx context.Context) error {
 		zap.Int("nodes_managed", managed),
 		zap.Int("failures", len(failures)))
 
+	// Matching nothing is almost always a misconfiguration rather than an empty
+	// tailnet, and it is the quietest way for this tool to fail: it keeps
+	// polling, writes nothing, and reports success. A node losing its tag - on
+	// a host rebuild, say - looks exactly like this. Say so loudly, and fail
+	// the run so a timer or CI check notices.
+	if managed == 0 && len(r.annotations) > 0 && len(nodes) > 0 {
+		r.logger.Error("Tag filter matched no nodes: nothing will be managed. "+
+			"Check that the expected nodes still carry the required tags.",
+			zap.Int("nodes_total", len(nodes)),
+			zap.Strings("required_tags", r.requiredTags()))
+		failures = append(failures, fmt.Errorf("tag filter matched none of the %d nodes in the tailnet", len(nodes)))
+	}
+
 	return errors.Join(failures...)
+}
+
+// requiredTags returns the configured tag filter, for logging.
+func (r *DNSReconciler) requiredTags() []string {
+	tags := make([]string, 0, len(r.annotations))
+	for tag := range r.annotations {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+	return tags
 }
 
 // logApplied records a change that was actually made. Under --dry-run the
@@ -708,6 +734,11 @@ func runDNSScale(config *Config) error {
 		logger.Info("Configured tag alias",
 			zap.String("tag", tag),
 			zap.String("name", name))
+	}
+
+	reconciler.protected = newProtectedMatcher(config.DNS.ProtectedNames, config.DNS.Domain)
+	for _, p := range config.DNS.ProtectedNames {
+		logger.Info("Protected from reclamation", zap.String("pattern", p))
 	}
 
 	reconciler.dryRun = config.App.DryRun

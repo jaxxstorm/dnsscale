@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -189,4 +190,39 @@ func (r *DNSReconciler) staticRecords() []providers.DNSRecord {
 		return records[i].Type < records[j].Type
 	})
 	return records
+}
+
+// protectedMatcher decides whether a name is exempt from reclamation.
+//
+// Patterns are qualified against the zone the same way alias entries are, so
+// "romence" and "romence.example.com" mean the same thing, and matched with
+// path.Match semantics - "*" matches any run of characters, dots included.
+type protectedMatcher struct {
+	patterns []string
+}
+
+func newProtectedMatcher(patterns []string, domain string) protectedMatcher {
+	out := make([]string, 0, len(patterns))
+	for _, p := range patterns {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, normalizeName(qualify(p, domain)))
+		}
+	}
+	return protectedMatcher{patterns: out}
+}
+
+// matches reports whether name is protected, and which pattern protected it.
+func (m protectedMatcher) matches(name string) (string, bool) {
+	name = normalizeName(name)
+	for _, p := range m.patterns {
+		if p == name {
+			return p, true
+		}
+		// A malformed pattern should never silently protect nothing, but it
+		// should also not stop the sweep; path.Match only errors on bad syntax.
+		if ok, err := path.Match(p, name); err == nil && ok {
+			return p, true
+		}
+	}
+	return "", false
 }

@@ -134,6 +134,18 @@ func (r *DNSReconciler) reclaimOrphans(ctx context.Context, desired map[recordKe
 
 		name := normalizeName(record.Name)
 
+		// Protection wins over ownership. A record can carry dnsscale's marker
+		// and still be one nobody wants reclaimed - infrastructure whose whole
+		// job is to stay reachable when the rest of the estate is not, for
+		// instance. Log when protection spares something, so it is visible
+		// rather than a silent absence from the orphan list.
+		if pattern, ok := r.protected.matches(name); ok {
+			r.logger.Info("Skipping protected record",
+				zap.String("record_name", record.Name),
+				zap.String("matched_pattern", pattern))
+			continue
+		}
+
 		// A name is orphaned when its owner is gone (node removed from the
 		// tailnet, or no longer matching the tag filter), or when the owner still
 		// exists but no longer claims this name (an alias removed from config).

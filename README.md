@@ -171,6 +171,8 @@ keep their conventional names:
 - `app.workers`: Number of worker goroutines (default: 2)
 - `app.poll_interval`: How often to poll Tailscale API (default: 30s)
 - `app.required_tags`: Only manage devices with these tags (optional)
+- `app.prune`: Delete records whose owning node no longer exists (default: false — orphans are reported only)
+- `dns.protected_names`: Names that are never deleted, whatever the ownership markers say
 
 ### Logging
 
@@ -353,6 +355,33 @@ dns:
 `type` defaults to `A`, or `AAAA` when the value looks like an IPv6 address.
 These records carry an ownership marker too, so removing one from the
 configuration causes it to be reclaimed on the next start.
+
+## Protecting Records From Reclamation
+
+`--prune` deletes records whose owning node no longer exists. Ownership is
+inferred from a TXT marker, and *owned* is not the same as *safe to delete*. A
+record can carry dnsscale's marker and still be one you never want reclaimed:
+
+- written under an earlier, looser configuration
+- belonging to a node that has simply stopped matching `required_tags`
+- naming infrastructure whose whole purpose is to be reachable when the rest of
+  the estate is not, such as an out-of-band management path
+
+```yaml
+dns:
+  protected_names:
+    - romence          # out-of-band recovery path, never reclaim
+    - "*.infra"
+```
+
+Entries are matched against the fully qualified name, so `romence` and
+`romence.example.com` are equivalent, and `*` matches any run of characters
+including dots. Protected names are skipped before anything is deleted, and the
+skip is logged, so protection is visible rather than a silent absence from the
+orphan list.
+
+Without this, `--prune` is only safe in a zone dnsscale exclusively owns — which
+is not the common case.
 
 ## Dry Runs and One-shot Mode
 

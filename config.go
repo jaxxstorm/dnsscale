@@ -75,6 +75,22 @@ type DNSConfig struct {
 	// StaticRecords are records dnsscale owns that are not derived from any
 	// node, such as a wildcard pointing at a fixed address.
 	StaticRecords []StaticRecord `mapstructure:"static_records" yaml:"static_records,omitempty"`
+
+	// ProtectedNames are never deleted, whatever else dnsscale concludes.
+	//
+	// Ownership is inferred from a TXT marker, and "owned" is not the same as
+	// "safe to delete". A record can carry dnsscale's marker and still be one
+	// nobody wants reclaimed: written under an earlier, looser configuration;
+	// belonging to a node that has simply stopped matching the tag filter; or
+	// naming infrastructure whose entire purpose is to be reachable when the
+	// rest of the estate is not - an out-of-band management path, say.
+	//
+	// Entries are matched against the fully qualified name and may use globs:
+	//
+	//   protected_names:
+	//     - romence          # out-of-band recovery path, never reclaim
+	//     - "*.infra"
+	ProtectedNames []string `mapstructure:"protected_names" yaml:"protected_names,omitempty"`
 }
 
 // StaticRecord is a record with a literal value, managed by dnsscale but not

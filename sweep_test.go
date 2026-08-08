@@ -239,3 +239,58 @@ func TestDryRunLogsNoAppliedChanges(t *testing.T) {
 		t.Error("dry run did not report what it would do")
 	}
 }
+
+// A protected name is never reclaimed, even with pruning on and even though it
+// carries a dnsscale ownership marker whose node is no longer managed. This is
+// the romence case: an out-of-band recovery path whose whole value is being
+// reachable when the rest of the estate is not.
+func TestSweepNeverPrunesProtectedNames(t *testing.T) {
+	var records []providers.DNSRecord
+	records = append(records, nodeRecords("romence.example.com", "gone-node", "100.88.29.49")...)
+	records = append(records, nodeRecords("stale.example.com", "gone-node", "100.64.0.9")...)
+	fake := newFakeProvider(records...)
+
+	r := testReconciler(t, fake)
+	r.prune = true // pruning fully enabled - protection must still hold
+	r.protected = newProtectedMatcher([]string{"romence"}, "example.com")
+
+	if err := r.sweep(context.Background()); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	got := fake.names()
+	want := []string{"A romence.example.com", "TXT romence.example.com"}
+	if !slices.Equal(got, want) {
+		t.Errorf("after prune: %v, want only the protected name %v", got, want)
+	}
+}
+
+func TestProtectedMatcher(t *testing.T) {
+	m := newProtectedMatcher([]string{"romence", "*.infra", "vpn.example.com"}, "example.com")
+
+	protected := []string{
+		"romence.example.com",  // bare name, qualified
+		"romence.example.com.", // trailing dot
+		"ROMENCE.example.com",  // case
+		"gw.infra.example.com", // glob
+		"vpn.example.com",      // already qualified in config
+	}
+	for _, name := range protected {
+		if _, ok := m.matches(name); !ok {
+			t.Errorf("%q should be protected", name)
+		}
+	}
+
+	for _, name := range []string{"fresno.example.com", "romence.other.com", "infra.example.com"} {
+		if pattern, ok := m.matches(name); ok {
+			t.Errorf("%q should NOT be protected (matched %q)", name, pattern)
+		}
+	}
+}
+
+func TestProtectedMatcherEmptyIsInert(t *testing.T) {
+	m := newProtectedMatcher(nil, "example.com")
+	if _, ok := m.matches("anything.example.com"); ok {
+		t.Error("an empty protection list must protect nothing")
+	}
+}

@@ -2,9 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"sort"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/jaxxstorm/dnsscale/providers"
 	"go.uber.org/zap"
@@ -199,3 +204,64 @@ func TestDeleteNodeDNSUnknownNodeIsNoOp(t *testing.T) {
 }
 
 func zapNop() *zap.Logger { return zap.NewNop() }
+
+// Matching no nodes is the quietest way this tool can fail: it keeps polling,
+// writes nothing, and reports success. A host losing its tag looks exactly like
+// this, so it must be loud and it must fail the run.
+func TestRunOnceFailsWhenTagFilterMatchesNothing(t *testing.T) {
+	nodes := []TailscaleNode{
+		{ID: "n1", Name: "laptop", Addresses: []string{"100.64.0.1"}, Tags: []string{"tag:personal"}},
+		{ID: "n2", Name: "phone", Addresses: []string{"100.64.0.2"}},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		devices := make([]TailscaleDevice, 0, len(nodes))
+		for _, n := range nodes {
+			devices = append(devices, TailscaleDevice{
+				ID: n.ID, Name: n.Name + ".example.ts.net", Authorized: true,
+				Addresses: n.Addresses, Tags: n.Tags, LastSeen: time.Now(),
+			})
+		}
+		json.NewEncoder(w).Encode(TailscaleDevicesResponse{Devices: devices})
+	}))
+	defer srv.Close()
+
+	ts := NewTailscaleClient("k", "example.com", zap.NewNop())
+	ts.baseURL = srv.URL
+
+	fake := newFakeProvider()
+	r := NewDNSReconciler(ts, fake, "example.com", 0, zap.NewNop())
+	r.annotations["tag:dns"] = "true"
+
+	err := r.RunOnce(context.Background())
+	if err == nil {
+		t.Fatal("expected an error when the tag filter matches nothing")
+	}
+	if !strings.Contains(err.Error(), "matched none") {
+		t.Errorf("error should name the cause, got: %v", err)
+	}
+	if len(fake.records) != 0 {
+		t.Errorf("nothing should have been written, got %v", fake.names())
+	}
+}
+
+// ...but a filter that matches something is not an error, and an empty tailnet
+// is not this failure mode.
+func TestRunOnceSucceedsWhenFilterMatches(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(TailscaleDevicesResponse{Devices: []TailscaleDevice{{
+			ID: "n1", Name: "web.example.ts.net", Authorized: true,
+			Addresses: []string{"100.64.0.1"}, Tags: []string{"tag:dns"}, LastSeen: time.Now(),
+		}}})
+	}))
+	defer srv.Close()
+
+	ts := NewTailscaleClient("k", "example.com", zap.NewNop())
+	ts.baseURL = srv.URL
+
+	r := NewDNSReconciler(ts, newFakeProvider(), "example.com", 0, zap.NewNop())
+	r.annotations["tag:dns"] = "true"
+
+	if err := r.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+}

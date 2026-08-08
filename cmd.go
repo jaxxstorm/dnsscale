@@ -272,6 +272,12 @@ dns:
 
   # Records dnsscale owns that are not derived from any node. The type defaults
   # to A, or AAAA when the value looks like an IPv6 address.
+  # Names dnsscale must never delete, whatever its ownership markers say.
+  # Matched against the fully qualified name; globs are allowed.
+  # protected_names:
+  #   - romence          # out-of-band recovery path, never reclaim
+  #   - "*.infra"
+
   # static_records:
   #   - name: "*"
   #     value: "100.64.0.1"
