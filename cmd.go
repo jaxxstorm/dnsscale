@@ -47,14 +47,16 @@ func init() {
 	rootCmd.PersistentFlags().String("tailscale-tailnet", "", "Tailscale tailnet name")
 
 	// DNS flags
-	rootCmd.PersistentFlags().String("dns-provider", "", "DNS provider (route53 or cloudflare)")
+	rootCmd.PersistentFlags().String("dns-provider", "", "DNS provider (route53, cloudflare, or pihole)")
 	rootCmd.PersistentFlags().String("dns-domain", "", "DNS domain to manage")
-	rootCmd.PersistentFlags().String("dns-zone-id", "", "DNS zone ID")
+	rootCmd.PersistentFlags().String("dns-zone-id", "", "DNS zone ID (not required for pihole)")
 
 	// Provider-specific flags
 	rootCmd.PersistentFlags().String("cloudflare-api-token", "", "Cloudflare API token")
 	rootCmd.PersistentFlags().String("route53-profile", "", "AWS profile to use")
 	rootCmd.PersistentFlags().String("route53-region", "", "AWS region")
+	rootCmd.PersistentFlags().String("pihole-base-url", "", "Pi-hole base URL (e.g., http://192.168.1.100)")
+	rootCmd.PersistentFlags().String("pihole-api-token", "", "Pi-hole API token")
 
 	// App flags
 	rootCmd.PersistentFlags().Int("workers", 2, "Number of worker goroutines")
@@ -74,6 +76,8 @@ func init() {
 	viper.BindPFlag("dns.cloudflare.api_token", rootCmd.PersistentFlags().Lookup("cloudflare-api-token"))
 	viper.BindPFlag("dns.route53.profile", rootCmd.PersistentFlags().Lookup("route53-profile"))
 	viper.BindPFlag("dns.route53.region", rootCmd.PersistentFlags().Lookup("route53-region"))
+	viper.BindPFlag("dns.pihole.base_url", rootCmd.PersistentFlags().Lookup("pihole-base-url"))
+	viper.BindPFlag("dns.pihole.api_token", rootCmd.PersistentFlags().Lookup("pihole-api-token"))
 	viper.BindPFlag("app.workers", rootCmd.PersistentFlags().Lookup("workers"))
 	viper.BindPFlag("app.poll_interval", rootCmd.PersistentFlags().Lookup("poll-interval"))
 	viper.BindPFlag("app.required_tags", rootCmd.PersistentFlags().Lookup("required-tags"))
@@ -88,6 +92,8 @@ func init() {
 	viper.BindEnv("dns.cloudflare.api_token", "CLOUDFLARE_API_TOKEN")
 	viper.BindEnv("dns.route53.profile", "AWS_PROFILE")
 	viper.BindEnv("dns.route53.region", "AWS_REGION")
+	viper.BindEnv("dns.pihole.base_url", "PIHOLE_BASE_URL")
+	viper.BindEnv("dns.pihole.api_token", "PIHOLE_API_TOKEN")
 }
 
 // initConfig reads in config file and ENV variables.
@@ -161,11 +167,11 @@ tailscale:
   tailnet: "example@gmail.com"
 
 dns:
-  # DNS provider: route53 or cloudflare
+  # DNS provider: route53, cloudflare, or pihole
   provider: "cloudflare"
   # The domain to manage DNS records for
   domain: "example.com"
-  # The zone ID from your DNS provider
+  # The zone ID from your DNS provider (not required for pihole)
   zone_id: "abc123def456"
   
   # Cloudflare-specific configuration (only needed if provider is cloudflare)
@@ -179,6 +185,13 @@ dns:
     profile: "default"
     # AWS region (optional, defaults to us-east-1)
     region: "us-east-1"
+  
+  # Pi-hole-specific configuration (only needed if provider is pihole)
+  pihole:
+    # Pi-hole base URL (e.g., http://192.168.1.100 or https://pihole.local)
+    base_url: "http://192.168.1.100"
+    # Pi-hole API token (get from Settings > API/Web interface > Show API token)
+    api_token: "your-pihole-api-token"
 
 app:
   # Number of worker goroutines for processing DNS updates
