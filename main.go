@@ -277,6 +277,10 @@ type DNSReconciler struct {
 	// prune enables deleting records whose owner no longer exists. Off unless
 	// explicitly requested.
 	prune bool
+	// dryRun suppresses the "this happened" log lines. The provider already
+	// reports what it would have done, and claiming a change was applied when
+	// it was not is worse than saying nothing.
+	dryRun bool
 }
 
 func NewDNSReconciler(ts *TailscaleClient, dns providers.DNSProvider, domain string, pollInterval time.Duration, logger *zap.Logger) *DNSReconciler {
@@ -335,6 +339,16 @@ func (r *DNSReconciler) RunOnce(ctx context.Context) error {
 		zap.Int("failures", len(failures)))
 
 	return errors.Join(failures...)
+}
+
+// logApplied records a change that was actually made. Under --dry-run the
+// provider has already logged what it would have done, so this stays quiet
+// instead of reporting a change that never happened.
+func (r *DNSReconciler) logApplied(msg string, fields ...zap.Field) {
+	if r.dryRun {
+		return
+	}
+	r.logger.Info(msg, fields...)
 }
 
 // Run starts the reconciliation loop
@@ -489,7 +503,7 @@ func (r *DNSReconciler) reconcile(ctx context.Context, key string) error {
 			return fmt.Errorf("update %s %s: %w", record.Type, record.Name, err)
 		}
 
-		r.logger.Info("Updated DNS record",
+		r.logApplied("Updated DNS record",
 			zap.String("record_type", record.Type),
 			zap.String("record_name", record.Name),
 			zap.String("record_value", record.Value),
@@ -547,7 +561,7 @@ func (r *DNSReconciler) deleteNodeDNS(ctx context.Context, nodeID string) error 
 			continue
 		}
 
-		r.logger.Info("Deleted DNS record",
+		r.logApplied("Deleted DNS record",
 			zap.String("record_name", recordToDelete.Name),
 			zap.String("record_type", recordToDelete.Type),
 			zap.String("node_id", nodeID))
@@ -696,6 +710,7 @@ func runDNSScale(config *Config) error {
 			zap.String("name", name))
 	}
 
+	reconciler.dryRun = config.App.DryRun
 	reconciler.prune = config.App.Prune
 	if config.App.Prune {
 		logger.Warn("Pruning is enabled: records whose owning node no longer exists will be deleted")

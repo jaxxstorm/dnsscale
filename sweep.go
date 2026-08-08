@@ -107,7 +107,7 @@ func (r *DNSReconciler) applyMissing(ctx context.Context, desired map[recordKey]
 			continue
 		}
 
-		r.logger.Info("Updated static DNS record",
+		r.logApplied("Updated static DNS record",
 			zap.String("record_name", record.Name),
 			zap.String("record_type", record.Type),
 			zap.String("record_value", record.Value))
@@ -187,7 +187,7 @@ func (r *DNSReconciler) reclaimOrphans(ctx context.Context, desired map[recordKe
 			continue
 		}
 
-		r.logger.Info("Reclaimed orphaned DNS record",
+		r.logApplied("Reclaimed orphaned DNS record",
 			zap.String("record_name", record.Name),
 			zap.String("record_type", record.Type),
 			zap.String("owner", owner))

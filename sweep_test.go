@@ -6,6 +6,9 @@ import (
 	"testing"
 
 	"github.com/jaxxstorm/dnsscale/providers"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestSweepWritesStaticRecords(t *testing.T) {
@@ -206,4 +209,33 @@ func TestSweepStillWritesStaticRecordsWithoutPrune(t *testing.T) {
 		}
 	}
 	t.Error("orphan was deleted despite pruning being off")
+}
+
+// Under --dry-run nothing is applied, so nothing may be logged as applied.
+// A log line claiming a change happened when it did not is the failure mode
+// that hides real problems.
+func TestDryRunLogsNoAppliedChanges(t *testing.T) {
+	logs, obs := observer.New(zapcore.InfoLevel)
+
+	fake := newFakeProvider(nodeRecords("gone.example.com", "old-node", "100.64.0.9")...)
+	r := NewDNSReconciler(nil, newDryRunProvider(fake, zap.New(logs)), "example.com", 0, zap.New(logs))
+	r.dryRun = true
+	r.static = []StaticRecord{{Name: "*", Type: "A", Value: "100.64.0.1", TTL: 300}}
+
+	if err := r.sweep(context.Background()); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	for _, entry := range obs.All() {
+		switch entry.Message {
+		case "Updated DNS record", "Updated static DNS record",
+			"Reclaimed orphaned DNS record", "Deleted DNS record":
+			t.Errorf("dry run logged an applied change: %q", entry.Message)
+		}
+	}
+
+	// The provider should still have reported the intent.
+	if obs.FilterMessageSnippet("would update").Len() == 0 {
+		t.Error("dry run did not report what it would do")
+	}
 }
