@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -360,11 +361,13 @@ func (r *DNSReconciler) reconcile(ctx context.Context, key string) error {
 			zap.String("node_name", node.Name))
 	}
 
-	// Create TXT ownership record to indicate this record is managed by dnsscale
+	// Create TXT ownership record to indicate this record is managed by dnsscale.
+	// The value is stored unquoted; quoting is a wire-format detail that each
+	// provider applies for itself when talking to its API.
 	txtRecord := providers.DNSRecord{
 		Name:  recordName,
 		Type:  "TXT",
-		Value: fmt.Sprintf("\"dnsscale-managed node_id=%s\"", node.ID),
+		Value: ownershipValue(node.ID),
 		TTL:   300,
 	}
 
@@ -382,44 +385,62 @@ func (r *DNSReconciler) reconcile(ctx context.Context, key string) error {
 	return nil
 }
 
-// deleteNodeDNS removes DNS records for a deleted node
+// ownershipValue builds the TXT payload that marks a record name as managed by
+// dnsscale on behalf of a specific Tailscale node.
+func ownershipValue(nodeID string) string {
+	return fmt.Sprintf("dnsscale-managed node_id=%s", nodeID)
+}
+
+// deleteNodeDNS removes DNS records for a deleted node. Ownership is recovered
+// from the TXT markers written by reconcile, so the provider's ListRecords must
+// return TXT records for this to find anything at all.
 func (r *DNSReconciler) deleteNodeDNS(ctx context.Context, nodeID string) error {
-	// In production, you'd need to track which records were created
-	// For now, we'll list and delete matching records
 	records, err := r.dnsProvider.ListRecords(ctx, r.domain)
 	if err != nil {
 		return err
 	}
 
+	// Collect every name this node owns before deleting anything. A node can own
+	// more than one name, so this has to scan the whole list rather than stop at
+	// the first ownership record it sees.
+	marker := fmt.Sprintf("node_id=%s", nodeID)
+	owned := make(map[string]bool)
 	for _, record := range records {
-		// Check if this is a TXT record managed by us with the specific node ID
-		if record.Type == "TXT" && strings.Contains(record.Value, fmt.Sprintf("node_id=%s", nodeID)) {
-			// This is our ownership record, delete all records with this name
-			recordName := record.Name
-			r.logger.Info("Found dnsscale-managed record to delete",
-				zap.String("record_name", recordName),
-				zap.String("node_id", nodeID))
-
-			// Delete all records (A, AAAA, TXT) with this name
-			for _, recordToDelete := range records {
-				if recordToDelete.Name == recordName {
-					if err := r.dnsProvider.DeleteRecord(ctx, r.domain, recordToDelete); err != nil {
-						r.logger.Error("Failed to delete DNS record",
-							zap.String("record_name", recordToDelete.Name),
-							zap.String("record_type", recordToDelete.Type),
-							zap.Error(err))
-					} else {
-						r.logger.Info("Deleted DNS record",
-							zap.String("record_name", recordToDelete.Name),
-							zap.String("record_type", recordToDelete.Type))
-					}
-				}
-			}
-			break // We found our record, no need to continue
+		if record.Type == "TXT" && strings.Contains(record.Value, marker) {
+			owned[record.Name] = true
 		}
 	}
 
-	return nil
+	if len(owned) == 0 {
+		r.logger.Info("No dnsscale-managed records found for node",
+			zap.String("node_id", nodeID))
+		return nil
+	}
+
+	// Delete every record (A, AAAA, TXT) sitting under an owned name.
+	var failures []error
+	for _, recordToDelete := range records {
+		if !owned[recordToDelete.Name] {
+			continue
+		}
+
+		if err := r.dnsProvider.DeleteRecord(ctx, r.domain, recordToDelete); err != nil {
+			r.logger.Error("Failed to delete DNS record",
+				zap.String("record_name", recordToDelete.Name),
+				zap.String("record_type", recordToDelete.Type),
+				zap.Error(err))
+			failures = append(failures, fmt.Errorf("delete %s %s: %w", recordToDelete.Type, recordToDelete.Name, err))
+			continue
+		}
+
+		r.logger.Info("Deleted DNS record",
+			zap.String("record_name", recordToDelete.Name),
+			zap.String("record_type", recordToDelete.Type),
+			zap.String("node_id", nodeID))
+	}
+
+	// Surface failures so the item is retried instead of being dropped as done.
+	return errors.Join(failures...)
 }
 
 // shouldManageNode determines if a node should have DNS records created
