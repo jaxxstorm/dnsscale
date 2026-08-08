@@ -120,7 +120,9 @@ export CLOUDFLARE_API_TOKEN="your-cloudflare-api-token"
 
 ### Tailscale Configuration
 
-- `tailscale.api_key`: Tailscale API key (get from https://login.tailscale.com/admin/settings/keys)
+- `tailscale.api_key`: Tailscale API key (get from https://login.tailscale.com/admin/settings/keys). Expires after 90 days
+- `tailscale.oauth_client_id` / `tailscale.oauth_client_secret`: OAuth client credentials (preferred - these do not expire). Needs only the `devices:core:read` scope
+- `tailscale.oauth_scopes`: Override the requested scopes (default: `devices:core:read`)
 - `tailscale.tailnet`: Your tailnet name (e.g., `example@gmail.com` or `example.ts.net`)
 
 ### DNS Configuration
@@ -169,11 +171,35 @@ For a device named `web-server` in domain `example.com`:
 
 ## Prerequisites
 
-### Tailscale API Key
+### Tailscale Authentication
 
-1. Go to https://login.tailscale.com/admin/settings/keys
-2. Create a new API key with appropriate permissions
-3. Use the key in your configuration
+DNSScale can authenticate with either an OAuth client or an API key.
+
+**Prefer an OAuth client.** Tailscale API keys expire 90 days after creation.
+When one expires, DNSScale keeps running and keeps polling - every request just
+returns 401, so reconciliation stops but nothing crashes and the zone quietly
+goes stale. OAuth client credentials do not expire, and the access token is
+refreshed automatically.
+
+1. Go to https://login.tailscale.com/admin/settings/oauth
+2. Generate an OAuth client with the **`devices:core:read`** scope
+
+   That is the only permission DNSScale needs: it reads the device list and
+   never writes to Tailscale.
+3. Configure the client ID and secret:
+
+   ```yaml
+   tailscale:
+     oauth_client_id: "k123456CNTRL"
+     oauth_client_secret: "tskey-client-xxxxx"
+     tailnet: "example.com"
+   ```
+
+   or `TAILSCALE_OAUTH_CLIENT_ID` / `TAILSCALE_OAUTH_CLIENT_SECRET`.
+
+To use an API key instead, create one at
+https://login.tailscale.com/admin/settings/keys and set `tailscale.api_key`.
+Set either the API key or the OAuth client, not both.
 
 ### Cloudflare Setup
 
