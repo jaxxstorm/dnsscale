@@ -52,6 +52,7 @@ func TestSweepReclaimsRecordsOfVanishedNode(t *testing.T) {
 	fake := newFakeProvider(records...)
 
 	r := testReconciler(t, fake)
+	r.prune = true // reclamation is opt-in
 	r.nodeCache["live-node"] = TailscaleNode{
 		ID:        "live-node",
 		Name:      "live",
@@ -78,6 +79,7 @@ func TestSweepReclaimsDroppedAlias(t *testing.T) {
 	fake := newFakeProvider(records...)
 
 	r := testReconciler(t, fake)
+	r.prune = true // reclamation is opt-in
 	r.nodeCache["n1"] = TailscaleNode{ID: "n1", Name: "fresno", Addresses: []string{"100.64.0.1"}}
 
 	if err := r.sweep(context.Background()); err != nil {
@@ -118,6 +120,7 @@ func TestSweepReclaimsNodeThatNoLongerMatchesFilter(t *testing.T) {
 	fake := newFakeProvider(nodeRecords("laptop.example.com", "n1", "100.64.0.5")...)
 
 	r := testReconciler(t, fake)
+	r.prune = true // reclamation is opt-in
 	r.annotations["tag:server"] = "true"
 	r.nodeCache["n1"] = TailscaleNode{
 		ID:        "n1",
@@ -149,4 +152,58 @@ func TestDryRunProviderMakesNoChanges(t *testing.T) {
 	if got := fake.names(); !slices.Equal(got, before) {
 		t.Errorf("dry run modified the zone: %v, want %v", got, before)
 	}
+}
+
+// Pruning is off by default: an orphan is reported, not deleted. Pointing
+// dnsscale at a zone that already has records must not silently empty it.
+func TestSweepDoesNotPruneByDefault(t *testing.T) {
+	var records []providers.DNSRecord
+	records = append(records, nodeRecords("gone.example.com", "old-node", "100.64.0.9")...)
+	records = append(records, nodeRecords("live.example.com", "live-node", "100.64.0.1")...)
+	fake := newFakeProvider(records...)
+	before := fake.names()
+
+	r := testReconciler(t, fake)
+	r.nodeCache["live-node"] = TailscaleNode{
+		ID:        "live-node",
+		Name:      "live",
+		Addresses: []string{"100.64.0.1"},
+	}
+
+	if err := r.sweep(context.Background()); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	if got := fake.names(); !slices.Equal(got, before) {
+		t.Errorf("sweep deleted records without --prune: %v, want %v", got, before)
+	}
+}
+
+// Static records are still applied when pruning is off - only the destructive
+// half is gated.
+func TestSweepStillWritesStaticRecordsWithoutPrune(t *testing.T) {
+	fake := newFakeProvider(nodeRecords("gone.example.com", "old-node", "100.64.0.9")...)
+	r := testReconciler(t, fake)
+	r.static = []StaticRecord{{Name: "*", Type: "A", Value: "100.64.0.1", TTL: 300}}
+
+	if err := r.sweep(context.Background()); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	var sawWildcard bool
+	for _, rec := range fake.records {
+		if rec.Name == "*.example.com" && rec.Type == "A" {
+			sawWildcard = true
+		}
+	}
+	if !sawWildcard {
+		t.Errorf("static record not written: %v", fake.names())
+	}
+	// ...and the orphan survived.
+	for _, rec := range fake.records {
+		if rec.Name == "gone.example.com" {
+			return
+		}
+	}
+	t.Error("orphan was deleted despite pruning being off")
 }

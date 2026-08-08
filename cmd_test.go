@@ -9,9 +9,22 @@ import (
 
 // A container deployment supplies every setting through the environment. This
 // has to work with no config file present at all.
+
+// clearAuthEnv makes a test independent of the ambient environment. Without it
+// these tests inherit whatever the developer's shell exports - a real API key
+// or OAuth client, say - and pass or fail based on that rather than on the
+// code. mise.local.toml and direnv both make that easy to hit.
+func clearAuthEnv(t *testing.T) {
+	t.Helper()
+	for _, env := range envBindings {
+		t.Setenv(env, "")
+	}
+}
+
 func TestConfigIsFullyEnvAddressable(t *testing.T) {
 	viper.Reset()
 	t.Cleanup(viper.Reset)
+	clearAuthEnv(t)
 
 	t.Setenv("TAILSCALE_API_KEY", "tskey-api-test")
 	t.Setenv("TAILSCALE_TAILNET", "example.com")
@@ -74,6 +87,7 @@ func TestConfigIsFullyEnvAddressable(t *testing.T) {
 func TestProviderCredentialsFromEnv(t *testing.T) {
 	viper.Reset()
 	t.Cleanup(viper.Reset)
+	clearAuthEnv(t)
 
 	t.Setenv("TAILSCALE_API_KEY", "tskey-api-test")
 	t.Setenv("TAILSCALE_TAILNET", "example.com")

@@ -127,6 +127,16 @@ type AppConfig struct {
 
 	// DryRun logs the changes that would be made without applying any of them.
 	DryRun bool `mapstructure:"dry_run" yaml:"dry_run,omitempty"`
+
+	// Prune enables reclaiming records whose owner no longer exists.
+	//
+	// Off by default, and deliberately so. dnsscale is frequently pointed at a
+	// zone that already contains records - including records an older or
+	// differently-configured dnsscale created. Deleting those without being
+	// asked is not a reasonable default: the first run against an existing zone
+	// should be additive. With this off, orphans are still detected and logged,
+	// so the drift is visible before anything acts on it.
+	Prune bool `mapstructure:"prune" yaml:"prune,omitempty"`
 }
 
 // LoggingConfig holds logging configuration

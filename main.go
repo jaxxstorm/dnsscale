@@ -274,6 +274,9 @@ type DNSReconciler struct {
 	// static holds records that belong to the configuration rather than to a
 	// node.
 	static []StaticRecord
+	// prune enables deleting records whose owner no longer exists. Off unless
+	// explicitly requested.
+	prune bool
 }
 
 func NewDNSReconciler(ts *TailscaleClient, dns providers.DNSProvider, domain string, pollInterval time.Duration, logger *zap.Logger) *DNSReconciler {
@@ -691,6 +694,11 @@ func runDNSScale(config *Config) error {
 		logger.Info("Configured tag alias",
 			zap.String("tag", tag),
 			zap.String("name", name))
+	}
+
+	reconciler.prune = config.App.Prune
+	if config.App.Prune {
+		logger.Warn("Pruning is enabled: records whose owning node no longer exists will be deleted")
 	}
 
 	reconciler.static = config.DNS.StaticRecords

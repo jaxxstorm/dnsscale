@@ -73,6 +73,7 @@ func init() {
 	rootCmd.PersistentFlags().Bool("manage-all-nodes", false, "Manage every authorized device when required-tags is empty")
 	rootCmd.PersistentFlags().Bool("once", false, "Run a single reconciliation pass and exit")
 	rootCmd.PersistentFlags().Bool("dry-run", false, "Log the changes that would be made without applying them")
+	rootCmd.PersistentFlags().Bool("prune", false, "Delete records whose owning node no longer exists (default: only report them)")
 
 	// Logging flags
 	rootCmd.PersistentFlags().String("log-level", "", "Log level (debug, info, warn, error)")
@@ -97,6 +98,7 @@ func init() {
 	viper.BindPFlag("app.manage_all_nodes", rootCmd.PersistentFlags().Lookup("manage-all-nodes"))
 	viper.BindPFlag("app.once", rootCmd.PersistentFlags().Lookup("once"))
 	viper.BindPFlag("app.dry_run", rootCmd.PersistentFlags().Lookup("dry-run"))
+	viper.BindPFlag("app.prune", rootCmd.PersistentFlags().Lookup("prune"))
 	viper.BindPFlag("logging.level", rootCmd.PersistentFlags().Lookup("log-level"))
 	viper.BindPFlag("logging.format", rootCmd.PersistentFlags().Lookup("log-format"))
 

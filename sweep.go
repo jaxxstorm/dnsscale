@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/jaxxstorm/dnsscale/providers"
 	"go.uber.org/zap"
@@ -146,6 +147,23 @@ func (r *DNSReconciler) reclaimOrphans(ctx context.Context, desired map[recordKe
 	}
 
 	if len(orphaned) == 0 {
+		return nil
+	}
+
+	// Reclaiming is opt-in. Reporting what would be reclaimed is not: the drift
+	// is worth surfacing on every run, and seeing it is what lets an operator
+	// decide whether turning pruning on is safe.
+	if !r.prune {
+		names := make([]string, 0, len(orphaned))
+		for name := range orphaned {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+
+		r.logger.Warn("Found dnsscale-managed records whose owner no longer exists. "+
+			"Not reclaiming them - pruning is off by default. Re-run with --prune (or app.prune: true) to delete them.",
+			zap.Strings("orphaned_names", names),
+			zap.Int("count", len(names)))
 		return nil
 	}
 
