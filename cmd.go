@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -84,16 +85,47 @@ func init() {
 	viper.BindPFlag("logging.level", rootCmd.PersistentFlags().Lookup("log-level"))
 	viper.BindPFlag("logging.format", rootCmd.PersistentFlags().Lookup("log-format"))
 
-	// Bind environment variables
-	viper.BindEnv("tailscale.api_key", "TAILSCALE_API_KEY")
-	viper.BindEnv("tailscale.tailnet", "TAILSCALE_TAILNET")
-	viper.BindEnv("dns.zone_id", "DNS_ZONE_ID")
-	viper.BindEnv("dns.domain", "DNS_DOMAIN")
-	viper.BindEnv("dns.cloudflare.api_token", "CLOUDFLARE_API_TOKEN")
-	viper.BindEnv("dns.route53.profile", "AWS_PROFILE")
-	viper.BindEnv("dns.route53.region", "AWS_REGION")
-	viper.BindEnv("dns.pihole.base_url", "PIHOLE_BASE_URL")
-	viper.BindEnv("dns.pihole.api_token", "PIHOLE_API_TOKEN")
+	bindEnvVars()
+}
+
+// bindEnvVars wires configuration keys to environment variables.
+//
+// Every key gets a binding. Keys reachable under the standard name (the config
+// key with dots replaced by underscores) are covered by the replacer plus
+// AutomaticEnv, but they are still bound explicitly here: AutomaticEnv alone
+// only resolves keys viper already knows about, which makes the set of settings
+// that actually work from the environment hard to predict.
+func bindEnvVars() {
+	// Map nested config keys onto environment variables by replacing dots with
+	// underscores: dns.provider -> DNS_PROVIDER, logging.level -> LOGGING_LEVEL.
+	// Without a replacer, AutomaticEnv looks for a variable literally named
+	// "DNS.PROVIDER" and every nested setting is unreachable.
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+
+	for key, env := range envBindings {
+		viper.BindEnv(key, env)
+	}
+}
+
+// envBindings maps each configuration key to the environment variable that sets
+// it. Most follow the dots-to-underscores convention; the AWS ones deliberately
+// use the conventional AWS_* names instead.
+var envBindings = map[string]string{
+	"tailscale.api_key":        "TAILSCALE_API_KEY",
+	"tailscale.tailnet":        "TAILSCALE_TAILNET",
+	"dns.provider":             "DNS_PROVIDER",
+	"dns.domain":               "DNS_DOMAIN",
+	"dns.zone_id":              "DNS_ZONE_ID",
+	"dns.cloudflare.api_token": "CLOUDFLARE_API_TOKEN",
+	"dns.route53.profile":      "AWS_PROFILE",
+	"dns.route53.region":       "AWS_REGION",
+	"dns.pihole.base_url":      "PIHOLE_BASE_URL",
+	"dns.pihole.api_token":     "PIHOLE_API_TOKEN",
+	"app.workers":              "APP_WORKERS",
+	"app.poll_interval":        "APP_POLL_INTERVAL",
+	"app.required_tags":        "APP_REQUIRED_TAGS",
+	"logging.level":            "LOGGING_LEVEL",
+	"logging.format":           "LOGGING_FORMAT",
 }
 
 // initConfig reads in config file and ENV variables.
