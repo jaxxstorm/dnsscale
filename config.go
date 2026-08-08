@@ -21,10 +21,31 @@ type Config struct {
 	Logging LoggingConfig `mapstructure:"logging" yaml:"logging"`
 }
 
-// TailscaleConfig holds Tailscale-specific configuration
+// TailscaleConfig holds Tailscale-specific configuration.
+//
+// Authentication is either an API key or an OAuth client. Prefer the OAuth
+// client: API keys expire after 90 days, and when one does, dnsscale keeps
+// running and silently stops reconciling - every poll fails with a 401 and the
+// zone quietly goes stale. OAuth clients do not expire, and the token is
+// refreshed automatically.
 type TailscaleConfig struct {
-	APIKey  string `mapstructure:"api_key" yaml:"api_key"`
+	APIKey  string `mapstructure:"api_key" yaml:"api_key,omitempty"`
 	Tailnet string `mapstructure:"tailnet" yaml:"tailnet"`
+
+	// OAuth credentials, from https://login.tailscale.com/admin/settings/oauth.
+	// dnsscale only ever reads the device list, so the client needs exactly one
+	// scope: devices:core:read.
+	OAuthClientID     string `mapstructure:"oauth_client_id" yaml:"oauth_client_id,omitempty"`
+	OAuthClientSecret string `mapstructure:"oauth_client_secret" yaml:"oauth_client_secret,omitempty"`
+
+	// OAuthScopes overrides the requested scopes. Rarely needed; the default is
+	// the minimum this tool actually uses.
+	OAuthScopes []string `mapstructure:"oauth_scopes" yaml:"oauth_scopes,omitempty"`
+}
+
+// UsesOAuth reports whether the OAuth client credentials flow is configured.
+func (t *TailscaleConfig) UsesOAuth() bool {
+	return t.OAuthClientID != "" || t.OAuthClientSecret != ""
 }
 
 // DNSConfig holds DNS provider configuration
@@ -116,9 +137,22 @@ type LoggingConfig struct {
 
 // Validate checks if the configuration is valid
 func (c *Config) Validate() error {
-	// Validate Tailscale configuration
-	if c.Tailscale.APIKey == "" {
-		return fmt.Errorf("tailscale.api_key is required")
+	// Validate Tailscale configuration. Either an API key or a complete OAuth
+	// client is required, but not both - accepting both would leave which one
+	// actually authenticates up to the reader.
+	switch {
+	case c.Tailscale.UsesOAuth() && c.Tailscale.APIKey != "":
+		return fmt.Errorf("tailscale.api_key and tailscale.oauth_client_id are mutually exclusive; set only one")
+	case c.Tailscale.UsesOAuth():
+		if c.Tailscale.OAuthClientID == "" {
+			return fmt.Errorf("tailscale.oauth_client_id is required when using an OAuth client")
+		}
+		if c.Tailscale.OAuthClientSecret == "" {
+			return fmt.Errorf("tailscale.oauth_client_secret is required when using an OAuth client")
+		}
+	case c.Tailscale.APIKey == "":
+		return fmt.Errorf("tailscale authentication is required: set either tailscale.api_key, " +
+			"or tailscale.oauth_client_id and tailscale.oauth_client_secret (preferred - API keys expire after 90 days)")
 	}
 	if c.Tailscale.Tailnet == "" {
 		return fmt.Errorf("tailscale.tailnet is required")
