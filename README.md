@@ -73,15 +73,41 @@ Run with configuration file:
 
 ### Environment Variables
 
+Every configuration setting can be supplied through the environment, so no
+configuration file is required.
+
 ```bash
 export TAILSCALE_API_KEY="tskey-api-xxxxx"
 export TAILSCALE_TAILNET="your-tailnet@gmail.com"
+export DNS_PROVIDER="cloudflare"
 export DNS_ZONE_ID="your-zone-id"
 export DNS_DOMAIN="example.com"
 export CLOUDFLARE_API_TOKEN="your-cloudflare-api-token"
 
-./dnsscale --dns-provider cloudflare
+./dnsscale
 ```
+
+The variable name for a setting is its configuration key with the dots replaced
+by underscores, upper-cased. The exceptions are the provider credentials, which
+keep their conventional names:
+
+| Setting | Environment variable |
+| --- | --- |
+| `tailscale.api_key` | `TAILSCALE_API_KEY` |
+| `tailscale.tailnet` | `TAILSCALE_TAILNET` |
+| `dns.provider` | `DNS_PROVIDER` |
+| `dns.domain` | `DNS_DOMAIN` |
+| `dns.zone_id` | `DNS_ZONE_ID` |
+| `dns.cloudflare.api_token` | `CLOUDFLARE_API_TOKEN` |
+| `dns.route53.profile` | `AWS_PROFILE` |
+| `dns.route53.region` | `AWS_REGION` |
+| `dns.pihole.base_url` | `PIHOLE_BASE_URL` |
+| `dns.pihole.api_token` | `PIHOLE_API_TOKEN` |
+| `app.workers` | `APP_WORKERS` |
+| `app.poll_interval` | `APP_POLL_INTERVAL` |
+| `app.required_tags` | `APP_REQUIRED_TAGS` (comma-separated) |
+| `logging.level` | `LOGGING_LEVEL` |
+| `logging.format` | `LOGGING_FORMAT` |
 
 ### Command-line Flags
 
@@ -113,7 +139,7 @@ export CLOUDFLARE_API_TOKEN="your-cloudflare-api-token"
 ### Run with Environment Variables
 
 ```bash
-./dnsscale --dns-provider cloudflare --log-level debug
+./dnsscale --log-level debug
 ```
 
 ## Configuration Options
