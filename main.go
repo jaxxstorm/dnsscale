@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -436,19 +437,19 @@ func (r *DNSReconciler) shouldManageNode(node TailscaleNode) bool {
 	return true
 }
 
-// Helper function to compare nodes
+// nodesEqual reports whether two observations of a node are equivalent for
+// reconciliation purposes. Anything compared here that changes causes the node
+// to be requeued, and anything omitted is a change dnsscale will not react to.
+//
+// Tags are included because they decide whether a node is managed at all: a
+// node that gains or loses a tag in app.required_tags needs to be reconsidered
+// even though its addresses have not moved.
 func nodesEqual(a, b TailscaleNode) bool {
-	if a.Name != b.Name || a.Online != b.Online || len(a.Addresses) != len(b.Addresses) {
+	if a.Name != b.Name || a.Online != b.Online {
 		return false
 	}
 
-	for i, addr := range a.Addresses {
-		if addr != b.Addresses[i] {
-			return false
-		}
-	}
-
-	return true
+	return slices.Equal(a.Addresses, b.Addresses) && slices.Equal(a.Tags, b.Tags)
 }
 
 // setupLogger creates a Zap logger with the specified config
