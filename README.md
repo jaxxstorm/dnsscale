@@ -417,6 +417,33 @@ orphan list.
 Without this, `--prune` is only safe in a zone dnsscale exclusively owns — which
 is not the common case.
 
+### What reclamation will and will not delete
+
+Ownership is tracked per *name*, but deletion is per *record*. A name dnsscale
+manages can legitimately carry records it never wrote, so only the types it
+creates are ever removed:
+
+| Record | Reclaimed? |
+| --- | --- |
+| `A`, `AAAA` | yes |
+| `TXT` carrying dnsscale's ownership marker | yes |
+| `TXT` written by anything else (SPF, verification tokens) | **no** |
+| `MX`, `CNAME`, `CAA`, `SRV`, `NS`, everything else | **no** |
+
+So a zone that mixes Tailscale records with mail records is safe: your `MX` and
+SPF survive even if the name they sit on is reclaimed.
+
+### A caveat about the zone apex
+
+Writes are upserts, and an upsert replaces the entire record set for a
+name/type. If you configure dnsscale to manage the apex — an alias of `@`, say —
+its ownership TXT will **replace any TXT already there**, which on most domains
+is the SPF record. That happens on the next poll, deletes nothing, and needs no
+`--prune`, so none of the protections above apply to it.
+
+dnsscale warns at startup if your configuration manages the apex. Generally,
+don't.
+
 ## Dry Runs and One-shot Mode
 
 ```bash

@@ -226,3 +226,27 @@ func (m protectedMatcher) matches(name string) (string, bool) {
 	}
 	return "", false
 }
+
+// reclaimable reports whether a record is one dnsscale could have created, and
+// may therefore delete.
+//
+// Ownership is tracked per NAME, but deletion must be per RECORD. A name that
+// dnsscale manages can legitimately carry records it did not write - an MX at a
+// name that also has an A record, an SPF TXT alongside the ownership marker,
+// a CAA record. Deleting the whole name would take those with it, and mail
+// records are exactly the kind of thing nobody notices is gone until delivery
+// fails.
+//
+// So only the types dnsscale writes are ever removed: address records, and TXT
+// records that carry its own marker. A foreign TXT at a managed name survives.
+func reclaimable(record providers.DNSRecord) bool {
+	switch record.Type {
+	case "A", "AAAA":
+		return true
+	case "TXT":
+		_, isOurs := ownerFromValue(record.Value)
+		return isOurs
+	default:
+		return false
+	}
+}

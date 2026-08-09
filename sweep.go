@@ -187,6 +187,14 @@ func (r *DNSReconciler) reclaimOrphans(ctx context.Context, desired map[recordKe
 			continue
 		}
 
+		// The name is ours; this particular record may not be.
+		if !reclaimable(record) {
+			r.logger.Info("Leaving record dnsscale did not create",
+				zap.String("record_name", record.Name),
+				zap.String("record_type", record.Type))
+			continue
+		}
+
 		if err := r.dnsProvider.DeleteRecord(ctx, r.domain, record); err != nil {
 			// A concurrent per-node delete may have removed this already, which
 			// is not a problem worth failing the sweep over.

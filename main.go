@@ -367,6 +367,46 @@ func (r *DNSReconciler) requiredTags() []string {
 	return tags
 }
 
+// warnIfManagingApex flags configuration that puts dnsscale on the zone apex.
+//
+// Writes are upserts, and an upsert replaces the whole record set for a
+// name/type. The apex is usually where MX, SPF and NS live, so managing it
+// means dnsscale's ownership TXT replaces any TXT already there - an SPF
+// record, typically - on the next poll. That breaks mail authentication
+// quietly and without deleting anything, so pruning being off is no defence.
+func warnIfManagingApex(config *Config, logger *zap.Logger) {
+	domain := config.DNS.Domain
+
+	names := []string{}
+	for node, aliases := range config.DNS.Aliases {
+		for _, alias := range aliases {
+			if qualify(alias, domain) == domain {
+				names = append(names, fmt.Sprintf("alias %q of node %q", alias, node))
+			}
+		}
+	}
+	for _, name := range config.DNS.TagAliases {
+		if qualify(name, domain) == domain {
+			names = append(names, fmt.Sprintf("tag alias %q", name))
+		}
+	}
+	for _, rec := range config.DNS.StaticRecords {
+		if qualify(rec.Name, domain) == domain && rec.Type == "TXT" {
+			names = append(names, fmt.Sprintf("static TXT record %q", rec.Name))
+		}
+	}
+
+	if len(names) == 0 {
+		return
+	}
+
+	logger.Warn("Configuration manages the zone apex, where MX, SPF and NS records usually live. "+
+		"Writes are upserts, so dnsscale's ownership TXT will replace any TXT already at the apex - "+
+		"an SPF record, for example - on the next poll.",
+		zap.String("apex", domain),
+		zap.Strings("from", names))
+}
+
 // logApplied records a change that was actually made. Under --dry-run the
 // provider has already logged what it would have done, so this stays quiet
 // instead of reporting a change that never happened.
@@ -578,6 +618,14 @@ func (r *DNSReconciler) deleteNodeDNS(ctx context.Context, nodeID string) error 
 			continue
 		}
 
+		// Owning the name does not mean owning everything under it.
+		if !reclaimable(recordToDelete) {
+			r.logger.Info("Leaving record dnsscale did not create",
+				zap.String("record_name", recordToDelete.Name),
+				zap.String("record_type", recordToDelete.Type))
+			continue
+		}
+
 		if err := r.dnsProvider.DeleteRecord(ctx, r.domain, recordToDelete); err != nil {
 			r.logger.Error("Failed to delete DNS record",
 				zap.String("record_name", recordToDelete.Name),
@@ -754,6 +802,8 @@ func runDNSScale(config *Config) error {
 			zap.String("record_type", rec.Type),
 			zap.String("record_value", rec.Value))
 	}
+
+	warnIfManagingApex(config, logger)
 
 	if config.App.Once {
 		if err := reconciler.RunOnce(ctx); err != nil {

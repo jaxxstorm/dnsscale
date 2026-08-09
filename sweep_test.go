@@ -294,3 +294,63 @@ func TestProtectedMatcherEmptyIsInert(t *testing.T) {
 		t.Error("an empty protection list must protect nothing")
 	}
 }
+
+// Ownership is tracked per name, but deletion must be per record. A managed
+// name can legitimately carry records dnsscale never wrote - an MX, a CAA, an
+// SPF TXT alongside the ownership marker. Reclaiming the name must not take
+// those with it. Mail records are the case that matters: nobody notices they
+// are gone until delivery fails.
+func TestSweepLeavesForeignRecordTypesAtAnOrphanedName(t *testing.T) {
+	var records []providers.DNSRecord
+	records = append(records, nodeRecords("mail.example.com", "gone-node", "100.64.0.9")...)
+	records = append(records,
+		providers.DNSRecord{Name: "mail.example.com", Type: "MX", Value: "10 in1-smtp.messagingengine.com.", TTL: 300},
+		providers.DNSRecord{Name: "mail.example.com", Type: "TXT", Value: "v=spf1 include:spf.messagingengine.com ?all", TTL: 300},
+		providers.DNSRecord{Name: "mail.example.com", Type: "CAA", Value: "0 issue \"letsencrypt.org\"", TTL: 300},
+	)
+	fake := newFakeProvider(records...)
+
+	r := testReconciler(t, fake)
+	r.prune = true
+
+	if err := r.sweep(context.Background()); err != nil {
+		t.Fatalf("sweep: %v", err)
+	}
+
+	got := fake.names()
+	want := []string{"CAA mail.example.com", "MX mail.example.com", "TXT mail.example.com"}
+	if !slices.Equal(got, want) {
+		t.Errorf("after prune: %v, want the foreign records to survive: %v", got, want)
+	}
+
+	// The surviving TXT must be the SPF record, not the ownership marker.
+	for _, rec := range fake.records {
+		if rec.Type == "TXT" {
+			if _, ours := ownerFromValue(rec.Value); ours {
+				t.Error("the ownership marker should have been reclaimed")
+			}
+		}
+	}
+}
+
+func TestReclaimable(t *testing.T) {
+	cases := []struct {
+		record providers.DNSRecord
+		want   bool
+	}{
+		{providers.DNSRecord{Type: "A", Value: "100.64.0.1"}, true},
+		{providers.DNSRecord{Type: "AAAA", Value: "fd7a::1"}, true},
+		{providers.DNSRecord{Type: "TXT", Value: ownershipValue("n1")}, true},
+		{providers.DNSRecord{Type: "TXT", Value: "v=spf1 -all"}, false},
+		{providers.DNSRecord{Type: "MX", Value: "10 mail.example.com."}, false},
+		{providers.DNSRecord{Type: "CNAME", Value: "elsewhere.example.com."}, false},
+		{providers.DNSRecord{Type: "CAA", Value: `0 issue "letsencrypt.org"`}, false},
+		{providers.DNSRecord{Type: "SRV", Value: "0 5 5060 sip.example.com."}, false},
+		{providers.DNSRecord{Type: "NS", Value: "ns-1.example.com."}, false},
+	}
+	for _, tc := range cases {
+		if got := reclaimable(tc.record); got != tc.want {
+			t.Errorf("reclaimable(%s %q) = %v, want %v", tc.record.Type, tc.record.Value, got, tc.want)
+		}
+	}
+}
