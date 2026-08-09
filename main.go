@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -255,6 +256,7 @@ func (r *DNSReconciler) syncNodes(ctx context.Context) {
 	}
 
 	r.logger.Debug("Syncing nodes", zap.Int("node_count", len(nodes)))
+	r.warnIfNoNodesMatch(nodes)
 
 	r.cacheMutex.Lock()
 	defer r.cacheMutex.Unlock()
@@ -284,6 +286,42 @@ func (r *DNSReconciler) syncNodes(ctx context.Context) {
 			r.logger.Info("Queuing node for deletion", zap.String("node_id", id))
 		}
 	}
+}
+
+// warnIfNoNodesMatch reports a tag filter that excludes every device.
+//
+// This is the quietest way dnsscale can fail. Nothing errors: the API call
+// succeeds, the poll loop keeps running, and every node is skipped one at a
+// time at debug level inside reconcile. From the outside the process looks
+// healthy while it manages nothing and the zone silently goes stale.
+//
+// It happens more easily than it sounds - a typo in required_tags, or a host
+// that loses its tags when it is rebuilt and re-enrolled. Both leave a running
+// service that has quietly stopped doing its job.
+//
+// An empty tailnet is deliberately not reported: that is a real state rather
+// than a misconfiguration.
+func (r *DNSReconciler) warnIfNoNodesMatch(nodes []TailscaleNode) {
+	if len(r.annotations) == 0 || len(nodes) == 0 {
+		return
+	}
+
+	for _, node := range nodes {
+		if r.shouldManageNode(node) {
+			return
+		}
+	}
+
+	tags := make([]string, 0, len(r.annotations))
+	for tag := range r.annotations {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+
+	r.logger.Error("Tag filter matched none of the devices in the tailnet, so no DNS records will be managed. "+
+		"Check that the expected devices still carry the required tags.",
+		zap.Int("devices_seen", len(nodes)),
+		zap.Strings("required_tags", tags))
 }
 
 // worker processes items from the queue
