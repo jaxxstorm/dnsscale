@@ -1,5 +1,39 @@
 # DNSScale
 
+> **This is a maintained fork of [jaxxstorm/dnsscale](https://github.com/jaxxstorm/dnsscale).**
+>
+> Upstream has had no commits since 2026-01-28, and has pull requests open for
+> over ten months, including functional contributions from people other than us.
+> We depend on this tool in production, so this fork is where the work happens.
+>
+> Everything here has been offered upstream where it generalises — PRs
+> [#6](https://github.com/jaxxstorm/dnsscale/pull/6),
+> [#7](https://github.com/jaxxstorm/dnsscale/pull/7),
+> [#8](https://github.com/jaxxstorm/dnsscale/pull/8),
+> [#9](https://github.com/jaxxstorm/dnsscale/pull/9) and
+> [#10](https://github.com/jaxxstorm/dnsscale/pull/10) — and they stay open. If
+> the project wakes up, we would rather this fork became unnecessary.
+>
+> **Bug fixes carried here** (all offered upstream):
+> - Node deletion never removed any records: Route53's `ListRecords` filtered
+>   out the TXT ownership markers the delete path matches on, so cleanup was
+>   dead code and every removed node leaked its records.
+> - `dns.provider` could not be set from the environment, which forced an
+>   out-of-band config file for otherwise env-driven deployments.
+> - Tag changes did not requeue a node, so tagging a device to bring it under
+>   management did nothing until its address changed or the process restarted.
+> - Tailscale API keys expire after 90 days, and expiry was silent — the
+>   process kept polling and reconciled nothing. Adds OAuth client support,
+>   which does not expire.
+> - A tag filter matching no devices was indistinguishable from working.
+>
+> **Features only in this fork** (not yet offered upstream, and a larger ask):
+> aliases so one node can own extra names, static records, tag-derived names,
+> `--once`, `--dry-run`, and a whole-zone sweep that reclaims orphaned records —
+> with reclamation off by default and a `protected_names` exemption list,
+> because "dnsscale owns this record" is not the same as "this record is safe
+> to delete".
+
 DNSScale is a tool that automatically manages DNS records for your Tailscale network devices. It monitors your Tailscale network and creates DNS records in your chosen DNS provider, making it easy to access your devices by hostname.
 
 ## Features

@@ -1,0 +1,51 @@
+name: CI
+
+# There is no CI upstream, and the only gate this fork had was `go vet` and
+# `go test` running inside the container build - which means a broken commit
+# was not caught until something tried to deploy it.
+on:
+  push:
+    branches: [main, container]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Track the version in go.mod rather than pinning twice.
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test -count=1 ./...
+
+      # This repo's Containerfile builds from the checked-out tree, so this
+      # verifies the source in this commit actually produces an image. (The
+      # deployment in the iac repo uses a different Containerfile that clones a
+      # pinned tag; that one is gated by the tag existing, and runs vet and the
+      # test suite inside the build itself.)
+      - name: container image builds
+        run: docker build -f Containerfile .
