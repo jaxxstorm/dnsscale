@@ -324,7 +324,12 @@ func (r *DNSReconciler) RunOnce(ctx context.Context) error {
 	r.cacheMutex.Unlock()
 
 	var failures []error
-	managed := 0
+	// Collected by name, not just counted. A count answers "how many nodes am I
+	// managing" but not "am I managing terraria", and the second question is the
+	// one asked when a name is missing from the zone. The polling loop reports
+	// the same set from logManagedSet; RunOnce never calls syncNodes, so without
+	// this the one-shot deployment loses that answer entirely.
+	var managed []string
 	for _, node := range nodes {
 		if !r.shouldManageNode(node) {
 			r.logger.Debug("Skipping node due to tag filters",
@@ -332,12 +337,13 @@ func (r *DNSReconciler) RunOnce(ctx context.Context) error {
 				zap.Strings("node_tags", node.Tags))
 			continue
 		}
-		managed++
+		managed = append(managed, node.Name)
 
 		if err := r.reconcile(ctx, node.ID); err != nil {
 			failures = append(failures, fmt.Errorf("node %s: %w", node.Name, err))
 		}
 	}
+	sort.Strings(managed)
 
 	if err := r.sweep(ctx); err != nil {
 		failures = append(failures, fmt.Errorf("sweep: %w", err))
@@ -345,7 +351,8 @@ func (r *DNSReconciler) RunOnce(ctx context.Context) error {
 
 	r.logger.Info("Single reconciliation pass complete",
 		zap.Int("nodes_total", len(nodes)),
-		zap.Int("nodes_managed", managed),
+		zap.Int("nodes_managed", len(managed)),
+		zap.Strings("managed_nodes", managed),
 		zap.Int("failures", len(failures)))
 
 	// Matching nothing is almost always a misconfiguration rather than an empty
@@ -353,7 +360,7 @@ func (r *DNSReconciler) RunOnce(ctx context.Context) error {
 	// polling, writes nothing, and reports success. A node losing its tag - on
 	// a host rebuild, say - looks exactly like this. Say so loudly, and fail
 	// the run so a timer or CI check notices.
-	if managed == 0 && len(r.annotations) > 0 && len(nodes) > 0 {
+	if len(managed) == 0 && len(r.annotations) > 0 && len(nodes) > 0 {
 		r.logger.Error("Tag filter matched no nodes: nothing will be managed. "+
 			"Check that the expected nodes still carry the required tags.",
 			zap.Int("nodes_total", len(nodes)),

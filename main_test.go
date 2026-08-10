@@ -13,6 +13,8 @@ import (
 
 	"github.com/jaxxstorm/dnsscale/providers"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // fakeProvider is an in-memory DNSProvider used to exercise the reconcile and
@@ -263,5 +265,53 @@ func TestRunOnceSucceedsWhenFilterMatches(t *testing.T) {
 
 	if err := r.RunOnce(context.Background()); err != nil {
 		t.Fatalf("RunOnce: %v", err)
+	}
+}
+
+// RunOnce must name the nodes it is managing, not just count them. The polling
+// loop reports the set from logManagedSet, but RunOnce never calls syncNodes,
+// so a one-shot deployment would otherwise have no way to answer "is dnsscale
+// looking at this node" - the question that a missing record actually raises.
+func TestRunOnceNamesTheManagedNodes(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(TailscaleDevicesResponse{Devices: []TailscaleDevice{
+			{ID: "n1", Name: "web.example.ts.net", Authorized: true,
+				Addresses: []string{"100.64.0.1"}, Tags: []string{"tag:dns"}, LastSeen: time.Now()},
+			{ID: "n2", Name: "terraria.example.ts.net", Authorized: true,
+				Addresses: []string{"100.64.0.2"}, LastSeen: time.Now()},
+			{ID: "n3", Name: "api.example.ts.net", Authorized: true,
+				Addresses: []string{"100.64.0.3"}, Tags: []string{"tag:dns"}, LastSeen: time.Now()},
+		}})
+	}))
+	defer srv.Close()
+
+	ts := NewTailscaleClient("k", "example.com", zap.NewNop())
+	ts.baseURL = srv.URL
+
+	core, logs := observer.New(zapcore.InfoLevel)
+	r := NewDNSReconciler(ts, newFakeProvider(), "example.com", 0, zap.New(core))
+	r.annotations["tag:dns"] = "true"
+
+	if err := r.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+
+	entries := logs.FilterMessage("Single reconciliation pass complete").All()
+	if len(entries) != 1 {
+		t.Fatalf("expected one completion line, got %d", len(entries))
+	}
+
+	// zap renders a Strings field into the context map as an opaque array, so
+	// compare its rendering rather than asserting a concrete slice type.
+	fields := entries[0].ContextMap()
+	if _, present := fields["managed_nodes"]; !present {
+		t.Fatalf("completion line should carry managed_nodes, got %v", fields)
+	}
+	// Sorted, tagged nodes only - the untagged one must be visible as an absence.
+	if got, want := fmt.Sprint(fields["managed_nodes"]), "[api web]"; got != want {
+		t.Errorf("managed_nodes = %s, want %s", got, want)
+	}
+	if got, want := fmt.Sprint(fields["nodes_managed"]), "2"; got != want {
+		t.Errorf("nodes_managed = %s, want %s", got, want)
 	}
 }
