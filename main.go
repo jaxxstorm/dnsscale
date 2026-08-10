@@ -744,11 +744,11 @@ func (r *DNSReconciler) shouldManageNode(node TailscaleNode) bool {
 // reported by the API, so it flips every time a device idles past the five
 // minute threshold and flips back when it checks in - and it feeds into no
 // record dnsscale writes. Comparing it requeued a node on every transition and
-// rewrote address records that had not changed: one laptop accounted for 241
+// rewrote address records that had not changed: one laptop accounted for 167
 // requeues in a single day on the fresno tailnet, and an offline-flapping game
-// server rewrote its three records four times in half an hour. The churn is not
-// only wasted Route53 calls, it is what made an untouched node look busy in the
-// log.
+// server rewrote its three records four times inside forty minutes. The churn
+// is not only wasted Route53 calls, it is what made an untouched node look busy
+// in the log.
 func nodesEqual(a, b TailscaleNode) bool {
 	if a.Name != b.Name {
 		return false
