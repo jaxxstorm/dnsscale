@@ -337,6 +337,31 @@ Only devices with these tags will have DNS records created.
 >   manage_all_nodes: true
 > ```
 
+### Reading the log when a name is missing
+
+A filtered-out node is invisible at `info` level, by design. dnsscale logs
+`Queuing node for reconciliation` only for nodes it will actually publish, and
+reports the admitted set whenever it changes:
+
+```
+INFO  Managed node set changed  {"managed_nodes": ["valheim", "web"], "nodes_managed": 2, "nodes_total": 37}
+```
+
+So if a name is missing from your zone, look for the node in `managed_nodes`
+first. If it is absent, dnsscale never intended to write it and the problem is
+the tag, not the DNS provider. Raise the level to `debug` to see each skipped
+node with the tags it actually carries:
+
+```
+DEBUG Not queuing node: it does not carry a required tag  {"node_name": "terraria", "node_tags": [], "required_tags": ["tag:dns"]}
+```
+
+This distinction used to be impossible to draw from the log. Every node was
+queued and announced at `info`, including ones the filter would discard a
+moment later at `debug` — so a stale untagged registration looked exactly like
+a node being actively published, and a missing record looked like a write that
+had silently failed.
+
 ## Aliases
 
 A node can own additional names. Alias records point at the same addresses as

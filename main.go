@@ -284,6 +284,13 @@ type DNSReconciler struct {
 	// reports what it would have done, and claiming a change was applied when
 	// it was not is worse than saying nothing.
 	dryRun bool
+
+	// lastManaged is the sorted set of node names the tag filter admitted on the
+	// previous poll, so membership changes can be logged without repeating the
+	// set on every poll. loggedManaged distinguishes "no nodes yet" from "an
+	// empty set, already reported". Both are guarded by cacheMutex.
+	lastManaged   []string
+	loggedManaged bool
 }
 
 func NewDNSReconciler(ts *TailscaleClient, dns providers.DNSProvider, domain string, pollInterval time.Duration, logger *zap.Logger) *DNSReconciler {
@@ -487,13 +494,39 @@ func (r *DNSReconciler) syncNodes(ctx context.Context) {
 	defer r.cacheMutex.Unlock()
 
 	currentNodes := make(map[string]bool)
+	managed := make([]string, 0, len(nodes))
 
 	// Check for new or updated nodes
 	for _, node := range nodes {
 		currentNodes[node.ID] = true
 
+		if r.shouldManageNode(node) {
+			managed = append(managed, node.Name)
+		}
+
 		if existingNode, exists := r.nodeCache[node.ID]; !exists || !nodesEqual(existingNode, node) {
+			// Cache every node regardless of the tag filter. The cache is what
+			// tells the next poll that a node has disappeared, and a node that
+			// was managed before it lost its tag still needs that.
 			r.nodeCache[node.ID] = node
+
+			// Queueing a node the tag filter will discard is not just wasted
+			// work, it is actively misleading: this line is the only INFO the
+			// reconciler emits per node, so a stale untagged registration
+			// appearing here reads as "dnsscale is publishing this name" when
+			// reconcile is about to drop it silently. That misreading is what
+			// produced a phantom-write bug report against fresno - five game
+			// servers logged here every poll, none of them tagged, none of them
+			// ever written. Say nothing at INFO about a node we will not touch.
+			if !r.shouldManageNode(node) {
+				r.logger.Debug("Not queuing node: it does not carry a required tag",
+					zap.String("node_name", node.Name),
+					zap.String("node_id", node.ID),
+					zap.Strings("node_tags", node.Tags),
+					zap.Strings("required_tags", r.requiredTags()))
+				continue
+			}
+
 			r.queue.Add(node.ID)
 			r.logger.Info("Queuing node for reconciliation",
 				zap.String("node_name", node.Name),
@@ -503,6 +536,8 @@ func (r *DNSReconciler) syncNodes(ctx context.Context) {
 		}
 	}
 
+	r.logManagedSet(managed, len(nodes))
+
 	// Check for deleted nodes
 	for id := range r.nodeCache {
 		if !currentNodes[id] {
@@ -511,6 +546,44 @@ func (r *DNSReconciler) syncNodes(ctx context.Context) {
 			r.logger.Info("Queuing node for deletion", zap.String("node_id", id))
 		}
 	}
+}
+
+// logManagedSet reports which nodes the tag filter currently admits, and does
+// so only when that set changes.
+//
+// Without this the log answers "what did dnsscale do" but never "what is
+// dnsscale looking at", and the two are easy to confuse when a name is missing
+// from the zone: the absence of a node from the log is indistinguishable from a
+// node that was processed and produced nothing. Printing the admitted set on
+// every change makes an untagged node visible as an omission rather than as
+// silence, at a cost of one line per membership change.
+//
+// Callers must hold cacheMutex.
+func (r *DNSReconciler) logManagedSet(managed []string, total int) {
+	sort.Strings(managed)
+	if r.loggedManaged && slices.Equal(r.lastManaged, managed) {
+		return
+	}
+	r.lastManaged = managed
+	r.loggedManaged = true
+
+	// Matching nothing is the quietest way for this tool to fail - it keeps
+	// polling, writes nothing and reports success - so it is worth more than an
+	// Info line. RunOnce makes the same check and fails the run; the daemon has
+	// no run to fail, so all it can do is say so loudly, once, each time the set
+	// empties.
+	if len(managed) == 0 && len(r.annotations) > 0 && total > 0 {
+		r.logger.Warn("Tag filter now matches no nodes: nothing will be managed. "+
+			"Check that the expected nodes still carry the required tags.",
+			zap.Int("nodes_total", total),
+			zap.Strings("required_tags", r.requiredTags()))
+		return
+	}
+
+	r.logger.Info("Managed node set changed",
+		zap.Strings("managed_nodes", managed),
+		zap.Int("nodes_managed", len(managed)),
+		zap.Int("nodes_total", total))
 }
 
 // worker processes items from the queue
@@ -666,8 +739,18 @@ func (r *DNSReconciler) shouldManageNode(node TailscaleNode) bool {
 // Tags are included because they decide whether a node is managed at all: a
 // node that gains or loses a tag in app.required_tags needs to be reconsidered
 // even though its addresses have not moved.
+//
+// Online is deliberately NOT compared. It is derived from LastSeen rather than
+// reported by the API, so it flips every time a device idles past the five
+// minute threshold and flips back when it checks in - and it feeds into no
+// record dnsscale writes. Comparing it requeued a node on every transition and
+// rewrote address records that had not changed: one laptop accounted for 241
+// requeues in a single day on the fresno tailnet, and an offline-flapping game
+// server rewrote its three records four times in half an hour. The churn is not
+// only wasted Route53 calls, it is what made an untouched node look busy in the
+// log.
 func nodesEqual(a, b TailscaleNode) bool {
-	if a.Name != b.Name || a.Online != b.Online {
+	if a.Name != b.Name {
 		return false
 	}
 
