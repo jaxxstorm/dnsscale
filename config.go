@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -20,10 +21,31 @@ type Config struct {
 	Logging LoggingConfig `mapstructure:"logging" yaml:"logging"`
 }
 
-// TailscaleConfig holds Tailscale-specific configuration
+// TailscaleConfig holds Tailscale-specific configuration.
+//
+// Authentication is either an API key or an OAuth client. Prefer the OAuth
+// client: API keys expire after 90 days, and when one does, dnsscale keeps
+// running and silently stops reconciling - every poll fails with a 401 and the
+// zone quietly goes stale. OAuth clients do not expire, and the token is
+// refreshed automatically.
 type TailscaleConfig struct {
-	APIKey  string `mapstructure:"api_key" yaml:"api_key"`
+	APIKey  string `mapstructure:"api_key" yaml:"api_key,omitempty"`
 	Tailnet string `mapstructure:"tailnet" yaml:"tailnet"`
+
+	// OAuth credentials, from https://login.tailscale.com/admin/settings/oauth.
+	// dnsscale only ever reads the device list, so the client needs exactly one
+	// scope: devices:core:read.
+	OAuthClientID     string `mapstructure:"oauth_client_id" yaml:"oauth_client_id,omitempty"`
+	OAuthClientSecret string `mapstructure:"oauth_client_secret" yaml:"oauth_client_secret,omitempty"`
+
+	// OAuthScopes overrides the requested scopes. Rarely needed; the default is
+	// the minimum this tool actually uses.
+	OAuthScopes []string `mapstructure:"oauth_scopes" yaml:"oauth_scopes,omitempty"`
+}
+
+// UsesOAuth reports whether the OAuth client credentials flow is configured.
+func (t *TailscaleConfig) UsesOAuth() bool {
+	return t.OAuthClientID != "" || t.OAuthClientSecret != ""
 }
 
 // DNSConfig holds DNS provider configuration
@@ -34,6 +56,53 @@ type DNSConfig struct {
 	Route53    Route53Config    `mapstructure:"route53" yaml:"route53,omitempty"`
 	Cloudflare CloudflareConfig `mapstructure:"cloudflare" yaml:"cloudflare,omitempty"`
 	Pihole     PiholeConfig     `mapstructure:"pihole" yaml:"pihole,omitempty"`
+
+	// Aliases gives a node additional names, keyed by Tailscale node name. The
+	// alias records carry the same addresses and the same ownership marker as
+	// the node's own record, so they are reclaimed when the node goes away.
+	//
+	//   aliases:
+	//     fresno: [music, mealie, memory]
+	Aliases map[string][]string `mapstructure:"aliases" yaml:"aliases,omitempty"`
+
+	// TagAliases derives a name from a tag: any managed node carrying the tag
+	// gets the corresponding name, pointing at that node's own addresses.
+	//
+	//   tag_aliases:
+	//     "tag:music": music
+	TagAliases map[string]string `mapstructure:"tag_aliases" yaml:"tag_aliases,omitempty"`
+
+	// StaticRecords are records dnsscale owns that are not derived from any
+	// node, such as a wildcard pointing at a fixed address.
+	StaticRecords []StaticRecord `mapstructure:"static_records" yaml:"static_records,omitempty"`
+
+	// ProtectedNames are never deleted, whatever else dnsscale concludes.
+	//
+	// Ownership is inferred from a TXT marker, and "owned" is not the same as
+	// "safe to delete". A record can carry dnsscale's marker and still be one
+	// nobody wants reclaimed: written under an earlier, looser configuration;
+	// belonging to a node that has simply stopped matching the tag filter; or
+	// naming infrastructure whose entire purpose is to be reachable when the
+	// rest of the estate is not - an out-of-band management path, say.
+	//
+	// Entries are matched against the fully qualified name and may use globs:
+	//
+	//   protected_names:
+	//     - romence          # out-of-band recovery path, never reclaim
+	//     - "*.infra"
+	ProtectedNames []string `mapstructure:"protected_names" yaml:"protected_names,omitempty"`
+}
+
+// StaticRecord is a record with a literal value, managed by dnsscale but not
+// tied to the lifecycle of any Tailscale node.
+type StaticRecord struct {
+	// Name is relative to dns.domain unless it already ends with it. "*" and
+	// "@" are accepted for the wildcard and the zone apex respectively.
+	Name string `mapstructure:"name" yaml:"name"`
+	// Type defaults to A, or AAAA when the value looks like an IPv6 address.
+	Type  string `mapstructure:"type" yaml:"type,omitempty"`
+	Value string `mapstructure:"value" yaml:"value"`
+	TTL   int64  `mapstructure:"ttl" yaml:"ttl,omitempty"`
 }
 
 // Route53Config holds AWS Route53 specific configuration
@@ -60,6 +129,30 @@ type AppConfig struct {
 	Workers      int           `mapstructure:"workers" yaml:"workers"`
 	PollInterval time.Duration `mapstructure:"poll_interval" yaml:"poll_interval"`
 	RequiredTags []string      `mapstructure:"required_tags" yaml:"required_tags,omitempty"`
+
+	// ManageAllNodes must be set explicitly to run with an empty required_tags
+	// list. Without it, an empty list means "publish every authorized device in
+	// the tailnet", which for a public zone means publishing the name and
+	// Tailscale address of every personal laptop and phone that has ever joined.
+	// That is a reasonable thing to want and an unreasonable thing to get by
+	// forgetting to set a filter.
+	ManageAllNodes bool `mapstructure:"manage_all_nodes" yaml:"manage_all_nodes,omitempty"`
+
+	// Once runs a single reconciliation pass and exits instead of polling.
+	Once bool `mapstructure:"once" yaml:"once,omitempty"`
+
+	// DryRun logs the changes that would be made without applying any of them.
+	DryRun bool `mapstructure:"dry_run" yaml:"dry_run,omitempty"`
+
+	// Prune enables reclaiming records whose owner no longer exists.
+	//
+	// Off by default, and deliberately so. dnsscale is frequently pointed at a
+	// zone that already contains records - including records an older or
+	// differently-configured dnsscale created. Deleting those without being
+	// asked is not a reasonable default: the first run against an existing zone
+	// should be additive. With this off, orphans are still detected and logged,
+	// so the drift is visible before anything acts on it.
+	Prune bool `mapstructure:"prune" yaml:"prune,omitempty"`
 }
 
 // LoggingConfig holds logging configuration
@@ -70,9 +163,22 @@ type LoggingConfig struct {
 
 // Validate checks if the configuration is valid
 func (c *Config) Validate() error {
-	// Validate Tailscale configuration
-	if c.Tailscale.APIKey == "" {
-		return fmt.Errorf("tailscale.api_key is required")
+	// Validate Tailscale configuration. Either an API key or a complete OAuth
+	// client is required, but not both - accepting both would leave which one
+	// actually authenticates up to the reader.
+	switch {
+	case c.Tailscale.UsesOAuth() && c.Tailscale.APIKey != "":
+		return fmt.Errorf("tailscale.api_key and tailscale.oauth_client_id are mutually exclusive; set only one")
+	case c.Tailscale.UsesOAuth():
+		if c.Tailscale.OAuthClientID == "" {
+			return fmt.Errorf("tailscale.oauth_client_id is required when using an OAuth client")
+		}
+		if c.Tailscale.OAuthClientSecret == "" {
+			return fmt.Errorf("tailscale.oauth_client_secret is required when using an OAuth client")
+		}
+	case c.Tailscale.APIKey == "":
+		return fmt.Errorf("tailscale authentication is required: set either tailscale.api_key, " +
+			"or tailscale.oauth_client_id and tailscale.oauth_client_secret (preferred - API keys expire after 90 days)")
 	}
 	if c.Tailscale.Tailnet == "" {
 		return fmt.Errorf("tailscale.tailnet is required")
@@ -109,6 +215,23 @@ func (c *Config) Validate() error {
 		}
 	default:
 		return fmt.Errorf("unsupported dns provider: %s (supported: route53, cloudflare, pihole)", c.DNS.Provider)
+	}
+
+	// An empty required_tags list means "manage every authorized device in the
+	// tailnet". That is a legitimate configuration, but it is a bad default to
+	// arrive at by omission: it publishes the hostname and Tailscale address of
+	// every personal device that has ever joined the tailnet into whatever zone
+	// is configured, which is frequently a public one. Require it to be said out
+	// loud.
+	if len(c.App.RequiredTags) == 0 && !c.App.ManageAllNodes {
+		return fmt.Errorf("app.required_tags is empty, which would publish DNS records for " +
+			"every authorized device in the tailnet, including personal laptops and phones. " +
+			"Set app.required_tags to restrict which nodes are managed, or set " +
+			"app.manage_all_nodes: true to confirm you want all of them")
+	}
+
+	if err := c.validateStaticRecords(); err != nil {
+		return err
 	}
 
 	// Validate app configuration
@@ -149,6 +272,41 @@ func (c *Config) Validate() error {
 			c.Logging.Format = "console" // Set default
 		} else {
 			return fmt.Errorf("invalid logging format: %s (supported: %v)", c.Logging.Format, validFormats)
+		}
+	}
+
+	return nil
+}
+
+// validateStaticRecords checks the static record table and fills in the type
+// and TTL defaults, so the reconciler can assume both are set.
+func (c *Config) validateStaticRecords() error {
+	for i := range c.DNS.StaticRecords {
+		rec := &c.DNS.StaticRecords[i]
+
+		if rec.Name == "" {
+			return fmt.Errorf("dns.static_records[%d]: name is required", i)
+		}
+		if rec.Value == "" {
+			return fmt.Errorf("dns.static_records[%d] (%s): value is required", i, rec.Name)
+		}
+
+		if rec.Type == "" {
+			rec.Type = "A"
+			if strings.Contains(rec.Value, ":") {
+				rec.Type = "AAAA"
+			}
+		}
+		rec.Type = strings.ToUpper(rec.Type)
+
+		switch rec.Type {
+		case "A", "AAAA", "CNAME", "TXT":
+		default:
+			return fmt.Errorf("dns.static_records[%d] (%s): unsupported type %s (supported: A, AAAA, CNAME, TXT)", i, rec.Name, rec.Type)
+		}
+
+		if rec.TTL <= 0 {
+			rec.TTL = defaultTTL
 		}
 	}
 

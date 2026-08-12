@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -39,12 +40,19 @@ func Execute() {
 func init() {
 	cobra.OnInitialize(initConfig)
 
+	// A runtime failure is not a usage error. Without this, every failed API
+	// call prints the full help text, which under a restart loop fills the
+	// container log with usage blocks instead of the actual error.
+	rootCmd.SilenceUsage = true
+
 	// Global flags
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.dnsscale.yaml)")
 
 	// Tailscale flags
 	rootCmd.PersistentFlags().String("tailscale-api-key", "", "Tailscale API key")
 	rootCmd.PersistentFlags().String("tailscale-tailnet", "", "Tailscale tailnet name")
+	rootCmd.PersistentFlags().String("tailscale-oauth-client-id", "", "Tailscale OAuth client ID (preferred over an API key; API keys expire after 90 days)")
+	rootCmd.PersistentFlags().String("tailscale-oauth-client-secret", "", "Tailscale OAuth client secret")
 
 	// DNS flags
 	rootCmd.PersistentFlags().String("dns-provider", "", "DNS provider (route53, cloudflare, or pihole)")
@@ -62,6 +70,10 @@ func init() {
 	rootCmd.PersistentFlags().Int("workers", 2, "Number of worker goroutines")
 	rootCmd.PersistentFlags().Duration("poll-interval", 0, "Interval to poll Tailscale API (e.g., 30s, 1m)")
 	rootCmd.PersistentFlags().StringSlice("required-tags", []string{}, "Only manage nodes with these tags")
+	rootCmd.PersistentFlags().Bool("manage-all-nodes", false, "Manage every authorized device when required-tags is empty")
+	rootCmd.PersistentFlags().Bool("once", false, "Run a single reconciliation pass and exit")
+	rootCmd.PersistentFlags().Bool("dry-run", false, "Log the changes that would be made without applying them")
+	rootCmd.PersistentFlags().Bool("prune", false, "Delete records whose owning node no longer exists (default: only report them)")
 
 	// Logging flags
 	rootCmd.PersistentFlags().String("log-level", "", "Log level (debug, info, warn, error)")
@@ -70,6 +82,8 @@ func init() {
 	// Bind flags to viper
 	viper.BindPFlag("tailscale.api_key", rootCmd.PersistentFlags().Lookup("tailscale-api-key"))
 	viper.BindPFlag("tailscale.tailnet", rootCmd.PersistentFlags().Lookup("tailscale-tailnet"))
+	viper.BindPFlag("tailscale.oauth_client_id", rootCmd.PersistentFlags().Lookup("tailscale-oauth-client-id"))
+	viper.BindPFlag("tailscale.oauth_client_secret", rootCmd.PersistentFlags().Lookup("tailscale-oauth-client-secret"))
 	viper.BindPFlag("dns.provider", rootCmd.PersistentFlags().Lookup("dns-provider"))
 	viper.BindPFlag("dns.domain", rootCmd.PersistentFlags().Lookup("dns-domain"))
 	viper.BindPFlag("dns.zone_id", rootCmd.PersistentFlags().Lookup("dns-zone-id"))
@@ -81,19 +95,59 @@ func init() {
 	viper.BindPFlag("app.workers", rootCmd.PersistentFlags().Lookup("workers"))
 	viper.BindPFlag("app.poll_interval", rootCmd.PersistentFlags().Lookup("poll-interval"))
 	viper.BindPFlag("app.required_tags", rootCmd.PersistentFlags().Lookup("required-tags"))
+	viper.BindPFlag("app.manage_all_nodes", rootCmd.PersistentFlags().Lookup("manage-all-nodes"))
+	viper.BindPFlag("app.once", rootCmd.PersistentFlags().Lookup("once"))
+	viper.BindPFlag("app.dry_run", rootCmd.PersistentFlags().Lookup("dry-run"))
+	viper.BindPFlag("app.prune", rootCmd.PersistentFlags().Lookup("prune"))
 	viper.BindPFlag("logging.level", rootCmd.PersistentFlags().Lookup("log-level"))
 	viper.BindPFlag("logging.format", rootCmd.PersistentFlags().Lookup("log-format"))
 
-	// Bind environment variables
-	viper.BindEnv("tailscale.api_key", "TAILSCALE_API_KEY")
-	viper.BindEnv("tailscale.tailnet", "TAILSCALE_TAILNET")
-	viper.BindEnv("dns.zone_id", "DNS_ZONE_ID")
-	viper.BindEnv("dns.domain", "DNS_DOMAIN")
-	viper.BindEnv("dns.cloudflare.api_token", "CLOUDFLARE_API_TOKEN")
-	viper.BindEnv("dns.route53.profile", "AWS_PROFILE")
-	viper.BindEnv("dns.route53.region", "AWS_REGION")
-	viper.BindEnv("dns.pihole.base_url", "PIHOLE_BASE_URL")
-	viper.BindEnv("dns.pihole.api_token", "PIHOLE_API_TOKEN")
+	bindEnvVars()
+}
+
+// bindEnvVars wires configuration keys to environment variables.
+//
+// Every key gets a binding. Keys reachable under the standard name (the config
+// key with dots replaced by underscores) are covered by the replacer plus
+// AutomaticEnv, but they are still bound explicitly here: AutomaticEnv alone
+// only resolves keys viper already knows about, which makes the set of settings
+// that actually work from the environment hard to predict.
+func bindEnvVars() {
+	// Map nested config keys onto environment variables by replacing dots with
+	// underscores: dns.provider -> DNS_PROVIDER, logging.level -> LOGGING_LEVEL.
+	// Without a replacer, AutomaticEnv looks for a variable literally named
+	// "DNS.PROVIDER" and every nested setting is unreachable.
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+
+	for key, env := range envBindings {
+		viper.BindEnv(key, env)
+	}
+}
+
+// envBindings maps each configuration key to the environment variable that sets
+// it. Most follow the dots-to-underscores convention; the AWS ones deliberately
+// use the conventional AWS_* names instead.
+var envBindings = map[string]string{
+	"tailscale.api_key":             "TAILSCALE_API_KEY",
+	"tailscale.tailnet":             "TAILSCALE_TAILNET",
+	"tailscale.oauth_client_id":     "TAILSCALE_OAUTH_CLIENT_ID",
+	"tailscale.oauth_client_secret": "TAILSCALE_OAUTH_CLIENT_SECRET",
+	"dns.provider":                  "DNS_PROVIDER",
+	"dns.domain":                    "DNS_DOMAIN",
+	"dns.zone_id":                   "DNS_ZONE_ID",
+	"dns.cloudflare.api_token":      "CLOUDFLARE_API_TOKEN",
+	"dns.route53.profile":           "AWS_PROFILE",
+	"dns.route53.region":            "AWS_REGION",
+	"dns.pihole.base_url":           "PIHOLE_BASE_URL",
+	"dns.pihole.api_token":          "PIHOLE_API_TOKEN",
+	"app.workers":                   "APP_WORKERS",
+	"app.poll_interval":             "APP_POLL_INTERVAL",
+	"app.required_tags":             "APP_REQUIRED_TAGS",
+	"app.manage_all_nodes":          "APP_MANAGE_ALL_NODES",
+	"app.once":                      "APP_ONCE",
+	"app.dry_run":                   "APP_DRY_RUN",
+	"logging.level":                 "LOGGING_LEVEL",
+	"logging.format":                "LOGGING_FORMAT",
 }
 
 // initConfig reads in config file and ENV variables.
@@ -161,6 +215,15 @@ func generateExampleConfig(outputFile string) error {
 # This is an example configuration file showing all available options
 
 tailscale:
+  # Authenticate with EITHER an OAuth client (preferred) or an API key.
+  #
+  # OAuth clients do not expire; API keys stop working 90 days after creation,
+  # and when that happens dnsscale keeps polling and silently stops reconciling.
+  # Create one at https://login.tailscale.com/admin/settings/oauth with the
+  # devices:core:read scope - that is all dnsscale needs.
+  # oauth_client_id: "k123456CNTRL"
+  # oauth_client_secret: "tskey-client-xxxxx"
+
   # Tailscale API key - get this from https://login.tailscale.com/admin/settings/keys
   api_key: "tskey-api-xxxxx"
   # Your tailnet name (e.g., example.ts.net or example@gmail.com)
@@ -193,16 +256,55 @@ dns:
     # Pi-hole API token (get from Settings > API/Web interface > Show API token)
     api_token: "your-pihole-api-token"
 
+  # Additional names for a node, keyed by Tailscale node name. Each alias points
+  # at the same addresses as the node and carries the same ownership marker, so
+  # aliases are reclaimed when the node is removed.
+  # aliases:
+  #   fresno:
+  #     - music
+  #     - mealie
+
+  # Derive a name from a tag. Any managed node carrying the tag gets the name,
+  # pointing at that node's own addresses. Useful when each service runs its own
+  # Tailscale sidecar with --advertise-tags.
+  # tag_aliases:
+  #   "tag:music": music
+
+  # Records dnsscale owns that are not derived from any node. The type defaults
+  # to A, or AAAA when the value looks like an IPv6 address.
+  # Names dnsscale must never delete, whatever its ownership markers say.
+  # Matched against the fully qualified name; globs are allowed.
+  # protected_names:
+  #   - romence          # out-of-band recovery path, never reclaim
+  #   - "*.infra"
+
+  # static_records:
+  #   - name: "*"
+  #     value: "100.64.0.1"
+  #   - name: "vpn"
+  #     type: "CNAME"
+  #     value: "gateway.example.com"
+
 app:
   # Number of worker goroutines for processing DNS updates
   workers: 2
   # How often to poll Tailscale API for changes
   poll_interval: "30s"
-  # Only manage nodes with these tags (optional)
-  # If empty, all nodes will be managed
+  # Only manage nodes with these tags.
+  #
+  # An empty list means EVERY authorized device in the tailnet gets a DNS
+  # record, including personal laptops and phones. If that is really what you
+  # want, set manage_all_nodes below to confirm it; otherwise list the tags that
+  # identify the machines you want published.
   required_tags:
     - "tag:production"
     - "tag:webserver"
+  # manage_all_nodes: false
+
+  # Run a single reconciliation pass and exit instead of polling.
+  # once: false
+  # Log the changes that would be made without applying any of them.
+  # dry_run: false
 
 logging:
   # Log level: debug, info, warn, error

@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +16,8 @@ import (
 	"github.com/jaxxstorm/dnsscale/providers"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/clientcredentials"
 	"k8s.io/client-go/util/workqueue"
 )
 
@@ -87,8 +92,18 @@ func (d *TailscaleDevice) ToTailscaleNode() TailscaleNode {
 	}
 }
 
+// tailscaleTokenURL is the OAuth token endpoint for the Tailscale API.
+const tailscaleTokenURL = "https://api.tailscale.com/api/v2/oauth/token"
+
+// defaultOAuthScopes is the minimum this tool needs. dnsscale only ever issues
+// GET /api/v2/tailnet/{tailnet}/devices, so read access to devices is enough -
+// there is no reason to grant an OAuth client anything wider.
+var defaultOAuthScopes = []string{"devices:core:read"}
+
 // TailscaleClient handles Tailscale API interactions
 type TailscaleClient struct {
+	// apiKey is empty when authenticating with an OAuth client, in which case
+	// httpClient attaches the bearer token itself.
 	apiKey     string
 	tailnet    string
 	logger     *zap.Logger
@@ -106,6 +121,61 @@ func NewTailscaleClient(apiKey, tailnet string, logger *zap.Logger) *TailscaleCl
 	}
 }
 
+// NewTailscaleOAuthClient builds a client that authenticates with an OAuth
+// client using the client credentials flow. The returned HTTP client fetches an
+// access token on first use and refreshes it automatically when it expires, so
+// unlike an API key this does not go stale after 90 days.
+func NewTailscaleOAuthClient(ctx context.Context, clientID, clientSecret, tailnet string, scopes []string, logger *zap.Logger) *TailscaleClient {
+	return newTailscaleOAuthClient(ctx, clientID, clientSecret, tailnet, tailscaleTokenURL, scopes, logger)
+}
+
+// newTailscaleOAuthClient is NewTailscaleOAuthClient with the token endpoint
+// injectable, so tests can point the exchange at a stub server.
+func newTailscaleOAuthClient(ctx context.Context, clientID, clientSecret, tailnet, tokenURL string, scopes []string, logger *zap.Logger) *TailscaleClient {
+	if len(scopes) == 0 {
+		scopes = defaultOAuthScopes
+	}
+
+	cfg := &clientcredentials.Config{
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		TokenURL:     tokenURL,
+		Scopes:       scopes,
+	}
+
+	// Bound the underlying transport the same way the API-key path is bounded;
+	// oauth2 reuses this client for the token exchange as well.
+	base := &http.Client{Timeout: 30 * time.Second}
+	httpClient := cfg.Client(context.WithValue(ctx, oauth2.HTTPClient, base))
+	httpClient.Timeout = 30 * time.Second
+
+	return &TailscaleClient{
+		tailnet:    tailnet,
+		logger:     logger,
+		httpClient: httpClient,
+		baseURL:    "https://api.tailscale.com",
+	}
+}
+
+// NewTailscaleClientFromConfig selects the authentication method the
+// configuration asks for. Validate() has already ensured exactly one is set.
+func NewTailscaleClientFromConfig(ctx context.Context, cfg *TailscaleConfig, logger *zap.Logger) *TailscaleClient {
+	if cfg.UsesOAuth() {
+		scopes := cfg.OAuthScopes
+		if len(scopes) == 0 {
+			scopes = defaultOAuthScopes
+		}
+		logger.Info("Authenticating to Tailscale with an OAuth client",
+			zap.String("client_id", cfg.OAuthClientID),
+			zap.Strings("scopes", scopes))
+		return NewTailscaleOAuthClient(ctx, cfg.OAuthClientID, cfg.OAuthClientSecret, cfg.Tailnet, cfg.OAuthScopes, logger)
+	}
+
+	logger.Warn("Authenticating to Tailscale with an API key. These expire 90 days after creation, " +
+		"after which reconciliation stops silently. Consider an OAuth client instead.")
+	return NewTailscaleClient(cfg.APIKey, cfg.Tailnet, logger)
+}
+
 func (t *TailscaleClient) ListNodes(ctx context.Context) ([]TailscaleNode, error) {
 	// URL encode the tailnet name to handle email addresses and special characters
 	encodedTailnet := url.QueryEscape(t.tailnet)
@@ -121,8 +191,11 @@ func (t *TailscaleClient) ListNodes(ctx context.Context) ([]TailscaleNode, error
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Set authentication header
-	req.Header.Set("Authorization", "Bearer "+t.apiKey)
+	// Set authentication header. With an OAuth client the token is attached by
+	// the HTTP client's transport, so setting it here would overwrite it.
+	if t.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+t.apiKey)
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "dnsscale/1.0")
 
@@ -135,6 +208,15 @@ func (t *TailscaleClient) ListNodes(ctx context.Context) ([]TailscaleNode, error
 
 	// Check for API errors
 	if resp.StatusCode != http.StatusOK {
+		// 401 against an API key is overwhelmingly an expired key rather than a
+		// wrong one, and the generic status text gives no hint of that. Say so:
+		// otherwise this failure mode looks like a transient error forever while
+		// the zone silently stops being reconciled.
+		if resp.StatusCode == http.StatusUnauthorized && t.apiKey != "" {
+			return nil, fmt.Errorf("API request failed with status %d: %s "+
+				"(Tailscale API keys expire 90 days after creation - if this worked before, the key has likely expired; "+
+				"an OAuth client does not expire)", resp.StatusCode, resp.Status)
+		}
 		return nil, fmt.Errorf("API request failed with status %d: %s", resp.StatusCode, resp.Status)
 	}
 
@@ -184,6 +266,31 @@ type DNSReconciler struct {
 	pollInterval time.Duration
 	annotations  map[string]string // For filtering based on tags
 	logger       *zap.Logger
+
+	// aliases maps a node name to the additional names it should own.
+	aliases map[string][]string
+	// tagAliases maps a Tailscale tag to a name that any node carrying the tag
+	// should own.
+	tagAliases map[string]string
+	// static holds records that belong to the configuration rather than to a
+	// node.
+	static []StaticRecord
+	// prune enables deleting records whose owner no longer exists. Off unless
+	// explicitly requested.
+	prune bool
+	// protected names are never reclaimed, whatever the ownership markers say.
+	protected protectedMatcher
+	// dryRun suppresses the "this happened" log lines. The provider already
+	// reports what it would have done, and claiming a change was applied when
+	// it was not is worse than saying nothing.
+	dryRun bool
+
+	// lastManaged is the sorted set of node names the tag filter admitted on the
+	// previous poll, so membership changes can be logged without repeating the
+	// set on every poll. loggedManaged distinguishes "no nodes yet" from "an
+	// empty set, already reported". Both are guarded by cacheMutex.
+	lastManaged   []string
+	loggedManaged bool
 }
 
 func NewDNSReconciler(ts *TailscaleClient, dns providers.DNSProvider, domain string, pollInterval time.Duration, logger *zap.Logger) *DNSReconciler {
@@ -196,7 +303,132 @@ func NewDNSReconciler(ts *TailscaleClient, dns providers.DNSProvider, domain str
 		pollInterval: pollInterval,
 		annotations:  make(map[string]string),
 		logger:       logger,
+		aliases:      make(map[string][]string),
+		tagAliases:   make(map[string]string),
 	}
+}
+
+// RunOnce performs a single reconciliation pass and returns. Unlike the polling
+// loop it works from a complete picture of the tailnet, so it also reclaims
+// records left behind by earlier runs and applies the static record table.
+func (r *DNSReconciler) RunOnce(ctx context.Context) error {
+	nodes, err := r.tailscale.ListNodes(ctx)
+	if err != nil {
+		return fmt.Errorf("list Tailscale nodes: %w", err)
+	}
+
+	r.cacheMutex.Lock()
+	for _, node := range nodes {
+		r.nodeCache[node.ID] = node
+	}
+	r.cacheMutex.Unlock()
+
+	var failures []error
+	// Collected by name, not just counted. A count answers "how many nodes am I
+	// managing" but not "am I managing terraria", and the second question is the
+	// one asked when a name is missing from the zone. The polling loop reports
+	// the same set from logManagedSet; RunOnce never calls syncNodes, so without
+	// this the one-shot deployment loses that answer entirely.
+	var managed []string
+	for _, node := range nodes {
+		if !r.shouldManageNode(node) {
+			r.logger.Debug("Skipping node due to tag filters",
+				zap.String("node_name", node.Name),
+				zap.Strings("node_tags", node.Tags))
+			continue
+		}
+		managed = append(managed, node.Name)
+
+		if err := r.reconcile(ctx, node.ID); err != nil {
+			failures = append(failures, fmt.Errorf("node %s: %w", node.Name, err))
+		}
+	}
+	sort.Strings(managed)
+
+	if err := r.sweep(ctx); err != nil {
+		failures = append(failures, fmt.Errorf("sweep: %w", err))
+	}
+
+	r.logger.Info("Single reconciliation pass complete",
+		zap.Int("nodes_total", len(nodes)),
+		zap.Int("nodes_managed", len(managed)),
+		zap.Strings("managed_nodes", managed),
+		zap.Int("failures", len(failures)))
+
+	// Matching nothing is almost always a misconfiguration rather than an empty
+	// tailnet, and it is the quietest way for this tool to fail: it keeps
+	// polling, writes nothing, and reports success. A node losing its tag - on
+	// a host rebuild, say - looks exactly like this. Say so loudly, and fail
+	// the run so a timer or CI check notices.
+	if len(managed) == 0 && len(r.annotations) > 0 && len(nodes) > 0 {
+		r.logger.Error("Tag filter matched no nodes: nothing will be managed. "+
+			"Check that the expected nodes still carry the required tags.",
+			zap.Int("nodes_total", len(nodes)),
+			zap.Strings("required_tags", r.requiredTags()))
+		failures = append(failures, fmt.Errorf("tag filter matched none of the %d nodes in the tailnet", len(nodes)))
+	}
+
+	return errors.Join(failures...)
+}
+
+// requiredTags returns the configured tag filter, for logging.
+func (r *DNSReconciler) requiredTags() []string {
+	tags := make([]string, 0, len(r.annotations))
+	for tag := range r.annotations {
+		tags = append(tags, tag)
+	}
+	sort.Strings(tags)
+	return tags
+}
+
+// warnIfManagingApex flags configuration that puts dnsscale on the zone apex.
+//
+// Writes are upserts, and an upsert replaces the whole record set for a
+// name/type. The apex is usually where MX, SPF and NS live, so managing it
+// means dnsscale's ownership TXT replaces any TXT already there - an SPF
+// record, typically - on the next poll. That breaks mail authentication
+// quietly and without deleting anything, so pruning being off is no defence.
+func warnIfManagingApex(config *Config, logger *zap.Logger) {
+	domain := config.DNS.Domain
+
+	names := []string{}
+	for node, aliases := range config.DNS.Aliases {
+		for _, alias := range aliases {
+			if qualify(alias, domain) == domain {
+				names = append(names, fmt.Sprintf("alias %q of node %q", alias, node))
+			}
+		}
+	}
+	for _, name := range config.DNS.TagAliases {
+		if qualify(name, domain) == domain {
+			names = append(names, fmt.Sprintf("tag alias %q", name))
+		}
+	}
+	for _, rec := range config.DNS.StaticRecords {
+		if qualify(rec.Name, domain) == domain && rec.Type == "TXT" {
+			names = append(names, fmt.Sprintf("static TXT record %q", rec.Name))
+		}
+	}
+
+	if len(names) == 0 {
+		return
+	}
+
+	logger.Warn("Configuration manages the zone apex, where MX, SPF and NS records usually live. "+
+		"Writes are upserts, so dnsscale's ownership TXT will replace any TXT already at the apex - "+
+		"an SPF record, for example - on the next poll.",
+		zap.String("apex", domain),
+		zap.Strings("from", names))
+}
+
+// logApplied records a change that was actually made. Under --dry-run the
+// provider has already logged what it would have done, so this stays quiet
+// instead of reporting a change that never happened.
+func (r *DNSReconciler) logApplied(msg string, fields ...zap.Field) {
+	if r.dryRun {
+		return
+	}
+	r.logger.Info(msg, fields...)
 }
 
 // Run starts the reconciliation loop
@@ -236,6 +468,15 @@ func (r *DNSReconciler) watchTailscale(ctx context.Context) {
 	// Initial sync
 	r.syncNodes(ctx)
 
+	// Sweep once at startup, which is where the whole-zone view is worth paying
+	// for: it applies the static records and reclaims anything left behind by a
+	// previous run. It deliberately does not run on every tick - steady-state
+	// deletion is handled by the per-node delete path, and sweeping alongside
+	// the workers would race with it over the same records.
+	if err := r.sweep(ctx); err != nil {
+		r.logger.Error("Initial zone sweep failed", zap.Error(err))
+	}
+
 	for {
 		select {
 		case <-ticker.C:
@@ -260,13 +501,39 @@ func (r *DNSReconciler) syncNodes(ctx context.Context) {
 	defer r.cacheMutex.Unlock()
 
 	currentNodes := make(map[string]bool)
+	managed := make([]string, 0, len(nodes))
 
 	// Check for new or updated nodes
 	for _, node := range nodes {
 		currentNodes[node.ID] = true
 
+		if r.shouldManageNode(node) {
+			managed = append(managed, node.Name)
+		}
+
 		if existingNode, exists := r.nodeCache[node.ID]; !exists || !nodesEqual(existingNode, node) {
+			// Cache every node regardless of the tag filter. The cache is what
+			// tells the next poll that a node has disappeared, and a node that
+			// was managed before it lost its tag still needs that.
 			r.nodeCache[node.ID] = node
+
+			// Queueing a node the tag filter will discard is not just wasted
+			// work, it is actively misleading: this line is the only INFO the
+			// reconciler emits per node, so a stale untagged registration
+			// appearing here reads as "dnsscale is publishing this name" when
+			// reconcile is about to drop it silently. That misreading is what
+			// produced a phantom-write bug report against fresno - five game
+			// servers logged here every poll, none of them tagged, none of them
+			// ever written. Say nothing at INFO about a node we will not touch.
+			if !r.shouldManageNode(node) {
+				r.logger.Debug("Not queuing node: it does not carry a required tag",
+					zap.String("node_name", node.Name),
+					zap.String("node_id", node.ID),
+					zap.Strings("node_tags", node.Tags),
+					zap.Strings("required_tags", r.requiredTags()))
+				continue
+			}
+
 			r.queue.Add(node.ID)
 			r.logger.Info("Queuing node for reconciliation",
 				zap.String("node_name", node.Name),
@@ -276,6 +543,8 @@ func (r *DNSReconciler) syncNodes(ctx context.Context) {
 		}
 	}
 
+	r.logManagedSet(managed, len(nodes))
+
 	// Check for deleted nodes
 	for id := range r.nodeCache {
 		if !currentNodes[id] {
@@ -284,6 +553,44 @@ func (r *DNSReconciler) syncNodes(ctx context.Context) {
 			r.logger.Info("Queuing node for deletion", zap.String("node_id", id))
 		}
 	}
+}
+
+// logManagedSet reports which nodes the tag filter currently admits, and does
+// so only when that set changes.
+//
+// Without this the log answers "what did dnsscale do" but never "what is
+// dnsscale looking at", and the two are easy to confuse when a name is missing
+// from the zone: the absence of a node from the log is indistinguishable from a
+// node that was processed and produced nothing. Printing the admitted set on
+// every change makes an untagged node visible as an omission rather than as
+// silence, at a cost of one line per membership change.
+//
+// Callers must hold cacheMutex.
+func (r *DNSReconciler) logManagedSet(managed []string, total int) {
+	sort.Strings(managed)
+	if r.loggedManaged && slices.Equal(r.lastManaged, managed) {
+		return
+	}
+	r.lastManaged = managed
+	r.loggedManaged = true
+
+	// Matching nothing is the quietest way for this tool to fail - it keeps
+	// polling, writes nothing and reports success - so it is worth more than an
+	// Info line. RunOnce makes the same check and fails the run; the daemon has
+	// no run to fail, so all it can do is say so loudly, once, each time the set
+	// empties.
+	if len(managed) == 0 && len(r.annotations) > 0 && total > 0 {
+		r.logger.Warn("Tag filter now matches no nodes: nothing will be managed. "+
+			"Check that the expected nodes still carry the required tags.",
+			zap.Int("nodes_total", total),
+			zap.Strings("required_tags", r.requiredTags()))
+		return
+	}
+
+	r.logger.Info("Managed node set changed",
+		zap.Strings("managed_nodes", managed),
+		zap.Int("nodes_managed", len(managed)),
+		zap.Int("nodes_total", total))
 }
 
 // worker processes items from the queue
@@ -333,93 +640,89 @@ func (r *DNSReconciler) reconcile(ctx context.Context, key string) error {
 		return nil
 	}
 
-	// Create DNS records for the node
-	recordName := fmt.Sprintf("%s.%s", node.Name, r.domain)
-
-	for _, addr := range node.Addresses {
-		recordType := "A"
-		if strings.Contains(addr, ":") {
-			recordType = "AAAA"
-		}
-
-		record := providers.DNSRecord{
-			Name:  recordName,
-			Type:  recordType,
-			Value: addr,
-			TTL:   300,
-		}
-
+	// Write the address records and the ownership marker for every name this
+	// node owns - its own, plus any aliases and tag-derived names.
+	for _, record := range r.recordsForNode(node) {
 		if err := r.dnsProvider.UpdateRecord(ctx, r.domain, record); err != nil {
-			return fmt.Errorf("failed to update DNS record: %w", err)
+			// The ownership marker is what makes cleanup possible, so a failure
+			// to write it must not be treated as success.
+			return fmt.Errorf("update %s %s: %w", record.Type, record.Name, err)
 		}
 
-		r.logger.Info("Updated DNS record",
-			zap.String("record_type", recordType),
+		r.logApplied("Updated DNS record",
+			zap.String("record_type", record.Type),
 			zap.String("record_name", record.Name),
-			zap.String("record_value", addr),
+			zap.String("record_value", record.Value),
 			zap.String("node_name", node.Name))
-	}
-
-	// Create TXT ownership record to indicate this record is managed by dnsscale
-	txtRecord := providers.DNSRecord{
-		Name:  recordName,
-		Type:  "TXT",
-		Value: fmt.Sprintf("\"dnsscale-managed node_id=%s\"", node.ID),
-		TTL:   300,
-	}
-
-	if err := r.dnsProvider.UpdateRecord(ctx, r.domain, txtRecord); err != nil {
-		r.logger.Warn("Failed to create TXT ownership record",
-			zap.String("record_name", txtRecord.Name),
-			zap.Error(err))
-		// Don't fail the entire reconciliation if TXT record fails
-	} else {
-		r.logger.Info("Updated TXT ownership record",
-			zap.String("record_name", txtRecord.Name),
-			zap.String("record_value", txtRecord.Value))
 	}
 
 	return nil
 }
 
-// deleteNodeDNS removes DNS records for a deleted node
+// deleteNodeDNS removes DNS records for a deleted node. Ownership is recovered
+// from the TXT markers written by reconcile, so the provider's ListRecords must
+// return TXT records for this to find anything at all.
 func (r *DNSReconciler) deleteNodeDNS(ctx context.Context, nodeID string) error {
-	// In production, you'd need to track which records were created
-	// For now, we'll list and delete matching records
 	records, err := r.dnsProvider.ListRecords(ctx, r.domain)
 	if err != nil {
 		return err
 	}
 
+	// Collect every name this node owns before deleting anything. A node can own
+	// more than one name, so this has to scan the whole list rather than stop at
+	// the first ownership record it sees.
+	//
+	// The owner is compared exactly rather than by substring: node IDs are not
+	// self-delimiting, so a substring match would let the ID "abc" claim records
+	// belonging to "abcdef".
+	owned := make(map[string]bool)
 	for _, record := range records {
-		// Check if this is a TXT record managed by us with the specific node ID
-		if record.Type == "TXT" && strings.Contains(record.Value, fmt.Sprintf("node_id=%s", nodeID)) {
-			// This is our ownership record, delete all records with this name
-			recordName := record.Name
-			r.logger.Info("Found dnsscale-managed record to delete",
-				zap.String("record_name", recordName),
-				zap.String("node_id", nodeID))
-
-			// Delete all records (A, AAAA, TXT) with this name
-			for _, recordToDelete := range records {
-				if recordToDelete.Name == recordName {
-					if err := r.dnsProvider.DeleteRecord(ctx, r.domain, recordToDelete); err != nil {
-						r.logger.Error("Failed to delete DNS record",
-							zap.String("record_name", recordToDelete.Name),
-							zap.String("record_type", recordToDelete.Type),
-							zap.Error(err))
-					} else {
-						r.logger.Info("Deleted DNS record",
-							zap.String("record_name", recordToDelete.Name),
-							zap.String("record_type", recordToDelete.Type))
-					}
-				}
-			}
-			break // We found our record, no need to continue
+		if record.Type != "TXT" {
+			continue
+		}
+		if owner, ok := ownerFromValue(record.Value); ok && owner == nodeID {
+			owned[normalizeName(record.Name)] = true
 		}
 	}
 
-	return nil
+	if len(owned) == 0 {
+		r.logger.Info("No dnsscale-managed records found for node",
+			zap.String("node_id", nodeID))
+		return nil
+	}
+
+	// Delete every record (A, AAAA, TXT) sitting under an owned name.
+	var failures []error
+	for _, recordToDelete := range records {
+		if !owned[normalizeName(recordToDelete.Name)] {
+			continue
+		}
+
+		// Owning the name does not mean owning everything under it.
+		if !reclaimable(recordToDelete) {
+			r.logger.Info("Leaving record dnsscale did not create",
+				zap.String("record_name", recordToDelete.Name),
+				zap.String("record_type", recordToDelete.Type))
+			continue
+		}
+
+		if err := r.dnsProvider.DeleteRecord(ctx, r.domain, recordToDelete); err != nil {
+			r.logger.Error("Failed to delete DNS record",
+				zap.String("record_name", recordToDelete.Name),
+				zap.String("record_type", recordToDelete.Type),
+				zap.Error(err))
+			failures = append(failures, fmt.Errorf("delete %s %s: %w", recordToDelete.Type, recordToDelete.Name, err))
+			continue
+		}
+
+		r.logApplied("Deleted DNS record",
+			zap.String("record_name", recordToDelete.Name),
+			zap.String("record_type", recordToDelete.Type),
+			zap.String("node_id", nodeID))
+	}
+
+	// Surface failures so the item is retried instead of being dropped as done.
+	return errors.Join(failures...)
 }
 
 // shouldManageNode determines if a node should have DNS records created
@@ -436,19 +739,29 @@ func (r *DNSReconciler) shouldManageNode(node TailscaleNode) bool {
 	return true
 }
 
-// Helper function to compare nodes
+// nodesEqual reports whether two observations of a node are equivalent for
+// reconciliation purposes. Anything compared here that changes causes the node
+// to be requeued, and anything omitted is a change dnsscale will not react to.
+//
+// Tags are included because they decide whether a node is managed at all: a
+// node that gains or loses a tag in app.required_tags needs to be reconsidered
+// even though its addresses have not moved.
+//
+// Online is deliberately NOT compared. It is derived from LastSeen rather than
+// reported by the API, so it flips every time a device idles past the five
+// minute threshold and flips back when it checks in - and it feeds into no
+// record dnsscale writes. Comparing it requeued a node on every transition and
+// rewrote address records that had not changed: one laptop accounted for 167
+// requeues in a single day on the fresno tailnet, and an offline-flapping game
+// server rewrote its three records four times inside forty minutes. The churn
+// is not only wasted Route53 calls, it is what made an untouched node look busy
+// in the log.
 func nodesEqual(a, b TailscaleNode) bool {
-	if a.Name != b.Name || a.Online != b.Online || len(a.Addresses) != len(b.Addresses) {
+	if a.Name != b.Name {
 		return false
 	}
 
-	for i, addr := range a.Addresses {
-		if addr != b.Addresses[i] {
-			return false
-		}
-	}
-
-	return true
+	return slices.Equal(a.Addresses, b.Addresses) && slices.Equal(a.Tags, b.Tags)
 }
 
 // setupLogger creates a Zap logger with the specified config
@@ -520,12 +833,17 @@ func runDNSScale(config *Config) error {
 	ctx := context.Background()
 
 	// Initialize Tailscale client
-	tsClient := NewTailscaleClient(config.Tailscale.APIKey, config.Tailscale.Tailnet, logger)
+	tsClient := NewTailscaleClientFromConfig(ctx, &config.Tailscale, logger)
 
 	// Initialize DNS provider
 	dnsProvider, err := createDNSProvider(ctx, config, logger)
 	if err != nil {
 		logger.Fatal("Failed to initialize DNS provider", zap.Error(err))
+	}
+
+	if config.App.DryRun {
+		logger.Info("Dry run: no DNS changes will be applied")
+		dnsProvider = newDryRunProvider(dnsProvider, logger)
 	}
 
 	// Create and run reconciler
@@ -535,6 +853,54 @@ func runDNSScale(config *Config) error {
 	for _, tag := range config.App.RequiredTags {
 		reconciler.annotations[tag] = "true"
 		logger.Info("Added required tag filter", zap.String("tag", tag))
+	}
+
+	if len(config.App.RequiredTags) == 0 {
+		logger.Warn("No required tags configured: every authorized device in the tailnet " +
+			"will be published, including personal devices")
+	}
+
+	for node, aliases := range config.DNS.Aliases {
+		reconciler.aliases[node] = aliases
+		logger.Info("Configured node aliases",
+			zap.String("node_name", node),
+			zap.Strings("aliases", aliases))
+	}
+
+	for tag, name := range config.DNS.TagAliases {
+		reconciler.tagAliases[tag] = name
+		logger.Info("Configured tag alias",
+			zap.String("tag", tag),
+			zap.String("name", name))
+	}
+
+	reconciler.protected = newProtectedMatcher(config.DNS.ProtectedNames, config.DNS.Domain)
+	for _, p := range config.DNS.ProtectedNames {
+		logger.Info("Protected from reclamation", zap.String("pattern", p))
+	}
+
+	reconciler.dryRun = config.App.DryRun
+	reconciler.prune = config.App.Prune
+	if config.App.Prune {
+		logger.Warn("Pruning is enabled: records whose owning node no longer exists will be deleted")
+	}
+
+	reconciler.static = config.DNS.StaticRecords
+	for _, rec := range config.DNS.StaticRecords {
+		logger.Info("Configured static record",
+			zap.String("record_name", qualify(rec.Name, config.DNS.Domain)),
+			zap.String("record_type", rec.Type),
+			zap.String("record_value", rec.Value))
+	}
+
+	warnIfManagingApex(config, logger)
+
+	if config.App.Once {
+		if err := reconciler.RunOnce(ctx); err != nil {
+			logger.Error("Single reconciliation pass reported failures", zap.Error(err))
+			return err
+		}
+		return nil
 	}
 
 	if err := reconciler.Run(ctx, config.App.Workers); err != nil {
